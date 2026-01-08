@@ -10,7 +10,8 @@ uv run examples/convert_jax_model_to_pytorch.py \
     --output_path /path/to/converted/pytorch/checkpoint
 ```
 4. run the following script
-
+- batch should be fixed to 128
+- ablation for aux-loss is needed. (0.1, 10, 100)
 ```bash
 torchrun --standalone --nnodes=1 --nproc_per_node=4(or 8) scripts/train_pytorch.py pi05_ours_low_mem_finetune_openvla_libero_pt_v2 \
 --exp_name (your_exp_name) --pytorch-weight_path (your pi0.5base model path) \

@@ -1,3 +1,13 @@
+# geo-vla
+
+```
+torchrun --standalone --nnodes=1 --nproc_per_node=4(or 8) scripts/train_pytorch.py pi05_ours_low_mem_finetune_openvla_libero_pt_v2 --exp_name (your_exp_name) --batch-size 128 --aux-loss-weight 1.0 (if you want to resume --resume) 
+```
+
+
+
+
+
 # openpi
 
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).

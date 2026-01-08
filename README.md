@@ -1,7 +1,9 @@
 # geo-vla
 
 ```
-torchrun --standalone --nnodes=1 --nproc_per_node=4(or 8) scripts/train_pytorch.py pi05_ours_low_mem_finetune_openvla_libero_pt_v2 --exp_name (your_exp_name) --batch-size 128 --aux-loss-weight 1.0 (if you want to resume --resume) 
+torchrun --standalone --nnodes=1 --nproc_per_node=4(or 8) scripts/train_pytorch.py pi05_ours_low_mem_finetune_openvla_libero_pt_v2 \
+--exp_name (your_exp_name) --pytorch-weight_path (your pi0.5base model path) \
+--batch-size 128 --aux-loss-weight 1.0 (if you want to resume --resume) 
 ```
 
 

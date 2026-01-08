@@ -1,0 +1,7 @@
+{
+  "count": 275567,
+  "min": 0.967495322227478,
+  "max": 0.9965627789497375,
+  "mean_npy": "/scratch2/whwjdqls99/depth_encoder/datasets/depth_mean.npy",
+  "std_npy": "/scratch2/whwjdqls99/depth_encoder/datasets/depth_std.npy"
+}

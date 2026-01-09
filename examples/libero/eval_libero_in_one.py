@@ -40,11 +40,6 @@ class PolicyCheckpoint:
 @dataclasses.dataclass
 class Args:
 	#################################################################################################################
-	# Policy parameters (in-process)
-	#################################################################################################################
-	policy: PolicyCheckpoint = dataclasses.field(default_factory=lambda: PolicyCheckpoint(config="pi05_libero", dir=""))
-
-	#################################################################################################################
 	# Preprocess / rollout parameters
 	#################################################################################################################
 	resize_size: int = 224
@@ -73,6 +68,35 @@ class Args:
 	#################################################################################################################
 	seed: int = 7
 
+	#################################################################################################################
+	# Compatibility
+	#################################################################################################################
+	trust_libero_init_states: bool = True
+	"""If True, allowlist NumPy globals needed for LIBERO's init-state `torch.load` on PyTorch 2.6+.
+
+	PyTorch 2.6 changed `torch.load` default `weights_only` to True, which can reject older pickles.
+	This allowlist should be safe if you trust the LIBERO init-state files on disk.
+	"""
+
+
+def _configure_torch_load_for_libero(*, trust_init_states: bool) -> None:
+	if not trust_init_states:
+		return
+	try:
+		import torch
+
+		# Needed for loading numpy arrays stored in older torch pickles.
+		torch.serialization.add_safe_globals([np.core.multiarray._reconstruct])  # type: ignore[attr-defined]
+		# These are commonly required alongside _reconstruct.
+		torch.serialization.add_safe_globals([np.ndarray, np.dtype])
+		try:
+			torch.serialization.add_safe_globals([np.core.multiarray.scalar])  # type: ignore[attr-defined]
+		except Exception:
+			pass
+	except Exception:
+		# If torch isn't available or API differs, just continue and let the original error surface.
+		pass
+
 
 def _max_steps_for_suite(name: str) -> int:
 	if name == "libero_spatial":
@@ -90,7 +114,7 @@ def _max_steps_for_suite(name: str) -> int:
 
 def _create_policy(policy_args: PolicyCheckpoint) -> _policy.Policy:
 	if not policy_args.dir:
-		raise ValueError("--args.policy.dir is required")
+		raise ValueError("--policy.dir is required")
 	train_cfg = _config.get_config(policy_args.config)
 	return _policy_config.create_trained_policy(
 		train_cfg,
@@ -100,8 +124,9 @@ def _create_policy(policy_args: PolicyCheckpoint) -> _policy.Policy:
 	)
 
 
-def eval_libero(args: Args) -> None:
+def eval_libero(policy: PolicyCheckpoint, args: Args) -> None:
 	np.random.seed(args.seed)
+	_configure_torch_load_for_libero(trust_init_states=args.trust_libero_init_states)
 
 	# Output paths
 	out_dir = pathlib.Path(args.out_dir)
@@ -137,9 +162,9 @@ def eval_libero(args: Args) -> None:
 	logging.info("Saving to: %s", str(out_dir))
 
 	# In-process policy
-	logging.info("Loading policy in-process (config=%s, dir=%s)", args.policy.config, args.policy.dir)
-	policy = _create_policy(args.policy)
-	logging.info("Policy metadata: %s", getattr(policy, "metadata", {}))
+	logging.info("Loading policy in-process (config=%s, dir=%s)", policy.config, policy.dir)
+	policy_obj = _create_policy(policy)
+	logging.info("Policy metadata: %s", getattr(policy_obj, "metadata", {}))
 
 	# Storage
 	episode_rows: list[dict[str, Any]] = []
@@ -167,7 +192,7 @@ def eval_libero(args: Args) -> None:
 
 			env.reset()
 			try:
-				policy.reset()
+				policy_obj.reset()
 			except Exception:
 				# Not all policies implement stateful reset.
 				pass
@@ -220,7 +245,7 @@ def eval_libero(args: Args) -> None:
 						}
 
 						# Query model (in-process)
-						out = policy.infer(element)
+						out = policy_obj.infer(element)
 						action_chunk = out["actions"]
 
 						if len(action_chunk) < args.replan_steps:
@@ -272,8 +297,8 @@ def eval_libero(args: Args) -> None:
 				{
 					"suite": suite_name,
 					"seed": args.seed,
-					"policy_config": args.policy.config,
-					"policy_dir": args.policy.dir,
+					"policy_config": policy.config,
+					"policy_dir": policy.dir,
 					"task_id": task_id,
 					"task_description": task_description,
 					"episode_idx": episode_idx,
@@ -321,10 +346,10 @@ def eval_libero(args: Args) -> None:
 			"suite": suite_name,
 			"seed": args.seed,
 			"policy": {
-				"config": args.policy.config,
-				"dir": args.policy.dir,
-				"default_prompt": args.policy.default_prompt,
-				"pytorch_device": args.policy.pytorch_device,
+				"config": policy.config,
+				"dir": policy.dir,
+				"default_prompt": policy.default_prompt,
+				"pytorch_device": policy.pytorch_device,
 			},
 			"resize_size": args.resize_size,
 			"replan_steps": args.replan_steps,
@@ -353,8 +378,8 @@ def eval_libero(args: Args) -> None:
 			{
 				"suite": suite_name,
 				"seed": args.seed,
-				"policy_config": args.policy.config,
-				"policy_dir": args.policy.dir,
+				"policy_config": policy.config,
+				"policy_dir": policy.dir,
 				"total_episodes": total_episodes,
 				"total_successes": total_successes,
 				"total_success_rate": total_sr,

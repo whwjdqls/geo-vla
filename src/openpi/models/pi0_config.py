@@ -26,6 +26,7 @@ class Pi0Config(_model.BaseModelConfig):
     point_expert_variant: _gemma.Variant | None = "point_head_v1"
     depth_expert_variant: _gemma.Variant | None = "depth_head_v1"
     depth_encoder_ckpt: str | None = None  # path to depth encoder checkpoint for depth expert
+    allow_aux_to_attend_suffix: bool = False  # whether to allow auxiliary expert to attend to suffix tokens
     # Set the model specific defaults.
     action_dim: int = 32
     action_horizon: int = 50

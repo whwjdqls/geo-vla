@@ -80,7 +80,7 @@ def make_att_2d_masks(pad_masks, att_masks):
     pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
     return att_2d_masks & pad_2d_masks
 
-def enforce_aux_attention_masks(att_2d_masks, aux_pad_masks, aux_start, aux_end, prefix_len, suffix_len):
+def enforce_aux_attention_masks(att_2d_masks, aux_pad_masks, aux_start, aux_end, prefix_len, suffix_len, allow_aux_to_attend_suffix=False):
     """Enforce auxiliary attention masks in the overall attention masks.
 
     Args:
@@ -105,6 +105,10 @@ def enforce_aux_attention_masks(att_2d_masks, aux_pad_masks, aux_start, aux_end,
     # aux can attend to itself
     att_2d_masks[:, aux_start:aux_end, aux_start:aux_end] = True
 
+    if allow_aux_to_attend_suffix:
+        # aux can attend to suffix
+        att_2d_masks[:, aux_start:aux_end, prefix_len:prefix_len+suffix_len] = True
+        
     return att_2d_masks
 
 
@@ -555,12 +559,13 @@ class PI0Pytorch(nn.Module):
             suffix_len = suffix_embs.shape[1]
             aux_start = prefix_len + suffix_len
             aux_end = aux_start + aux_embs.shape[1]
-            att_2d_masks = enforce_aux_attention_masks(att_2d_masks, aux_pad_masks, aux_start, aux_end, prefix_len, suffix_len)
+            att_2d_masks = enforce_aux_attention_masks(att_2d_masks, aux_pad_masks, aux_start, aux_end, prefix_len, \
+                suffix_len, allow_aux_to_attend_suffix=self.config.allow_aux_to_attend_suffix)
             # import numpy as np
             # from PIL import Image  
             # # np.save("att_2d_masks_new.npy", att_2d_masks.cpu().numpy())
             # att_2d_masks_cpu = att_2d_masks[0].cpu().numpy().astype(np.uint8) * 255
-            # Image.fromarray(att_2d_masks_cpu).save("att_2d_masks_new.png")
+            # Image.fromarray(att_2d_masks_cpu).save("att_2d_masks_new_debug.png")
         
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 

@@ -1,3 +1,27 @@
+# geo-vla
+## train geo-vla with point track world modeling as auxiliary task
+0. setup env
+1. download pi0.5 base model
+2. convert it in to pytorch model
+```bash
+uv run examples/convert_jax_model_to_pytorch.py \
+    --checkpoint_dir /path/to/jax/checkpoint \
+    --config_name <config name - this will be the original pi0.5 config name> \
+    --output_path /path/to/converted/pytorch/checkpoint
+```
+4. run the following script
+- batch should be fixed to 128
+- ablation for aux-loss is needed. (0.1, 10, 100)
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=4(or 8) scripts/train_pytorch.py pi05_ours_low_mem_finetune_openvla_libero_pt_v2 \
+--exp_name (your_exp_name) --pytorch-weight_path (your pi0.5base model path) \
+--batch-size 128 --aux-loss-weight 1.0 (if you want to resume --resume) 
+```
+
+
+
+
+
 # openpi
 
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).

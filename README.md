@@ -17,8 +17,11 @@ torchrun --standalone --nnodes=1 --nproc_per_node=4(or 8) scripts/train_pytorch.
 --exp_name (your_exp_name) --pytorch-weight_path (your pi0.5base model path) \
 --batch-size 128 --aux-loss-weight 1.0 (if you want to resume --resume) 
 ```
-
-
+## Evaluate geo-vla-pt on libero
+```bash
+bash ./examples/libero/eval_libero_in_one_v2.sh
+```
+You can give multiple checkpoints, save videos, change seeds. All the description is in the bash file.
 
 
 

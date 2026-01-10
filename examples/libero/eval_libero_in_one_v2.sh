@@ -14,7 +14,7 @@ SUITES_DEFAULT="libero_goal libero_spatial libero_object libero_10"
 
 NO_SAVE_VIDEOS_DEFAULT=1
 JOBS_DEFAULT=1
-
+SEED_DEFAULT=7
 usage() {
   cat <<'EOF'
 Usage:
@@ -45,7 +45,8 @@ POLICY_CONFIG="${POLICY_CONFIG_DEFAULT}"
 POLICY_ROOT="${POLICY_ROOT_DEFAULT}"
 CHECKPOINTS="${CHECKPOINTS_DEFAULT}"
 SUITES="${SUITES_DEFAULT}"
-OUT_SUBDIR="eval_outputs"
+SEED="${SEED_DEFAULT}"
+OUT_SUBDIR="eval_outputs_${SEED_DEFAULT}"
 NO_SAVE_VIDEOS="${NO_SAVE_VIDEOS_DEFAULT}"
 JOBS="${JOBS_DEFAULT}"
 
@@ -88,7 +89,8 @@ run_one() {
     --policy.dir="${policy_dir}" \
     "${no_save_flag[@]}" \
     --args.out_dir "${out_dir}" \
-    --args.task_suite_name "${suite}"
+    --args.task_suite_name "${suite}" \
+    --args.seed "${SEED}"
 }
 
 export -f run_one
@@ -129,6 +131,7 @@ else
       --policy.dir="${policy_dir}" \
       "${no_save_flag[@]}" \
       --args.out_dir "${out_dir}" \
-      --args.task_suite_name "${suite}"
+      --args.task_suite_name "${suite}"\
+      --args.seed "${SEED}"
   '
 fi

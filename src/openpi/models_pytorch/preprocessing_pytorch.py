@@ -189,12 +189,19 @@ def preprocess_point_cloud_pytorch(point_cloud, stats,*, train: bool = False):
     std = torch.tensor(stats["point_cloud"]["std"], device=point_cloud.device).squeeze()  # (D,)
     mean = mean.to(point_cloud.dtype)
     std = std.to(point_cloud.dtype)
-    point_cloud = (point_cloud - mean) / std
+    # point_cloud = (point_cloud - mean) / std # buggg mean, std should be delta mean, delta std
     
     # input point cloud
     input_point_cloud = point_cloud[:, 0, :, :].unsqueeze(1)  # (BS, 1, N, D)
+    input_point_cloud = (input_point_cloud - mean) / std
+    
+    delta_mean = torch.tensor(stats["point_cloud"]["delta_mean"], device=point_cloud.device).squeeze()  # (D,)
+    delta_std = torch.tensor(stats["point_cloud"]["delta_std"], device=point_cloud.device).squeeze()  # (D,)
+    delta_mean = delta_mean.to(point_cloud.dtype)
+    delta_std = delta_std.to(point_cloud.dtype)
     output_point_delta = point_cloud[:, 1:, :, :] - point_cloud[:, :-1, :, :]  # (BS, T-1, N, D)
-
+    output_point_delta = (output_point_delta - delta_mean) / delta_std
+    
     return input_point_cloud, output_point_delta
 
 

@@ -133,7 +133,7 @@ def get_config(variant: Variant) -> Config:
         )
         assert config.aux_dim % 3 == 0, "aux_dim must be divisible by 3"
         return config
-    if variant == "point_head_v3":
+    if variant == "point_head_v3": # this is the one that uses 1024 full point clouds
         # 31M params
         config =  Config(
             width=1024,

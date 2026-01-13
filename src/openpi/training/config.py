@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.robocasa_policy as robocasa_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -444,6 +445,91 @@ class LeRobotLiberoPointTrackDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
+        )
+@dataclasses.dataclass(frozen=True)
+class LeRobotRobocasaPointTrackDataConfig(DataConfigFactory):
+    """
+    This config is used to configure transforms that are applied at various parts of the data pipeline.
+    For your own dataset, you can copy this class and modify the transforms to match your dataset based on the
+    comments below.
+    """
+
+    extra_delta_transform: bool = False
+    use_local_data: bool = False
+    root_dir: str | None = None
+    action_sequence_keys: Sequence[str] = ("actions", "point_cloud")
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+
+        # The repack transform is *only* applied to the data coming from the dataset,
+        # and *not* during inference. We can use it to make inputs from the dataset look
+        # as close as possible to those coming from the inference environment (e.g. match the keys).
+        # Below, we match the keys in the dataset (which we defined in the data conversion script) to
+        # the keys we use in our inference pipeline (defined in the inference script for libero).
+        # For your own dataset, first figure out what keys your environment passes to the policy server
+        # and then modify the mappings below so your dataset's keys get matched to those target keys.
+        # The repack transform simply remaps key names here.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/right_image": "right_image",
+                        "observation/left_image": "left_image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        # "language_instruction": "prompt",
+                        "prompt": "language_instruction",
+                        "point_cloud": "point_cloud",
+                    }
+                )
+            ]
+        )
+        # The data transforms are applied to the data coming from the dataset *and* during inference.
+        # Below, we define the transforms for data going into the model (``inputs``) and the transforms
+        # for data coming out of the model (``outputs``) (the latter is only used during inference).
+        # We defined these transforms in `libero_policy.py`. You can check the detailed comments there for
+        # how to modify the transforms to match your dataset. Once you created your own transforms, you can
+        # replace the transforms below with your own.
+        data_transforms = _transforms.Group(
+            # inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+            # outputs=[libero_policy.LiberoOutputs()],
+            inputs = [robocasa_policy.RobocasaInputs(model_type=model_config.model_type)],
+            outputs = [robocasa_policy.RobocasaOutputs()],
+        )
+
+        # One additional data transform: pi0 models are trained on delta actions (relative to the first
+        # state in each action chunk). IF your data has ``absolute`` actions (e.g. target joint angles)
+        # you can uncomment the following line to convert the actions to delta actions. The only exception
+        # is for the gripper actions which are always absolute.
+        # In the example below, we would apply the delta conversion to the first 6 actions (joints) and
+        # leave the 7th action (gripper) unchanged, i.e. absolute.
+        # In Libero, the raw actions in the dataset are already delta actions, so we *do not* need to
+        # apply a separate delta conversion (that's why it's commented out). Choose whether to apply this
+        # transform based on whether your dataset uses ``absolute`` or ``delta`` actions out of the box.
+
+        # LIBERO already represents actions as deltas, but we have some old Pi0 checkpoints that are trained with this
+        # extra delta transform.
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        # You do not need to change anything here for your own dataset.
+        model_transforms = ModelTransformFactory()(model_config)
+
+        # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            use_local_data=self.use_local_data,
+            root_dir=self.root_dir,
         )
 
 
@@ -1098,6 +1184,110 @@ _CONFIGS = [
         freeze_filter=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
+        # aux_loss_weight=0.1,
+    ),
+    TrainConfig( # this is a point track head with bigger point expert
+        name="pi05_robocasa_pt",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False,
+                                   paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+                                   ),
+        # use_local_data=True,
+        data=LeRobotRobocasaPointTrackDataConfig(
+            use_local_data=True,
+            root_dir="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
+            repo_id="whwjdqls99/robocasa_pt",
+            base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
+            extra_delta_transform=False, # robocasa actions are already delta
+        ),
+        # batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/scratch2/whwjdqls99/pi/pi05_base", # please override this
+        num_train_steps=30_000,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
+        # aux_loss_weight=0.1,
+    ),
+    TrainConfig( # this is a point track head with bigger point expert
+        name="pi05_robocasa_pt_v3_attend_action",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False,
+                                   paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+                                   aux_expert_type="point",
+                                   point_expert_variant="point_head_v3",
+                                   allow_aux_to_attend_suffix=True
+                                   ),
+        # use_local_data=True,
+        data=LeRobotRobocasaPointTrackDataConfig(
+            use_local_data=True,
+            root_dir="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
+            repo_id="whwjdqls99/robocasa_pt",
+            base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
+            extra_delta_transform=False, # robocasa actions are already delta
+        ),
+        # batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/scratch2/whwjdqls99/pi/pi05_base", # please override this
+        num_train_steps=30_000,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
+        # aux_loss_weight=0.1,
+    ),
+    TrainConfig( # this is a point track head with bigger point expert
+        name="pi05_robocasa_pt_v2_attend_action",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False,
+                                   paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+                                   aux_expert_type="point",
+                                   point_expert_variant="point_head_v2",
+                                   allow_aux_to_attend_suffix=True
+                                   ),
+        # use_local_data=True,
+        data=LeRobotRobocasaPointTrackDataConfig(
+            # repo_id="physical-intelligence/libero",
+            repo_id="whwjdqls99/robocasa_lerobot",
+            base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
+            extra_delta_transform=False, # robocasa actions are already delta
+        ),
+        # batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/scratch2/whwjdqls99/pi/pi05_base", # please override this
+        num_train_steps=30_000,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
         ema_decay=None,
         checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
         # aux_loss_weight=0.1,

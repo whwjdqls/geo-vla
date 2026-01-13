@@ -237,7 +237,15 @@ class PI0Pytorch(nn.Module):
         )
     def get_stats_from_loader(self, loader):
         """Helper method to get point cloud stats from dataset."""
-        self.stats = loader._data_loader._data_loader.dataset._dataset._dataset.meta.stats
+        if hasattr(loader._data_loader._data_loader.dataset, "meta"):
+            self.stats = loader._data_loader._data_loader.dataset.meta.stats
+        elif hasattr(loader._data_loader._data_loader.dataset._dataset, "meta"):
+            self.stats = loader._data_loader._data_loader.dataset._dataset.meta.stats
+        elif hasattr(loader._data_loader._data_loader.dataset._dataset._dataset, "meta"):
+            self.stats = loader._data_loader._data_loader.dataset._dataset._dataset.meta.stats
+
+        else:
+            raise ValueError("Cannot find dataset meta to get stats.")
     
     def _preprocess_point_cloud(self, point_cloud, *, train=True):
         """Helper method to preprocess point cloud."""
@@ -488,7 +496,7 @@ class PI0Pytorch(nn.Module):
         
         point_cloud = None
         # check if they have the point_cloud attribute
-        if hasattr(observation, "point_cloud") and observation.point_cloud is not None:
+        if hasattr(observation, "point_cloud") and observation.point_cloud is not None and self.config.aux_expert_type == "point":
             input_point_cloud, output_point_delta = self._preprocess_point_cloud(observation.point_cloud, train=True)
             assert output_point_delta.shape[1] == self.config.action_horizon, f"output_point_delta.shape[1] ({output_point_delta.shape[1]}) must be equal to action_horizon ({self.config.action_horizon})"
             BS, _, original_N, D = input_point_cloud.shape
@@ -501,7 +509,7 @@ class PI0Pytorch(nn.Module):
 
             aux_embs, aux_pad_masks, aux_att_masks = self.embed_aux(aux_input, aux_target)
 
-        elif hasattr(observation, "depth_image") and observation.depth_image is not None:
+        elif hasattr(observation, "depth_image") and observation.depth_image is not None and self.config.aux_expert_type == "depth":
             input_depth_token, target_depth_tokens = self._preprocess_depth(observation.depth_image, train=True)
             assert target_depth_tokens.shape[1] == self.config.action_horizon, (
                 f"target_depth_tokens.shape[1] ({target_depth_tokens.shape[1]}) must be equal to action_horizon ({self.config.action_horizon})"

@@ -1,7 +1,7 @@
 from multiprocessing.dummy import freeze_support
 import os
 # 이 줄을 반드시 'import lerobot' 보다 위에 적으세요!
-os.environ["HF_HUB_OFFLINE"] = "1"
+# os.environ["HF_HUB_OFFLINE"] = "1"/
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
@@ -33,17 +33,22 @@ from huggingface_hub import HfApi
 # hub_api.create_tag("whwjdqls99/libero_hdfr_lerobot_dataset_depth", tag="v2.0", repo_type="dataset")
 # # # 1. Do NOT set HF_HUB_OFFLINE to 1, or the download will fail.
 # # # (If you previously set it in this script, delete that line or set it to '0')
-
-dataset = lerobot_dataset.LeRobotDataset(
-    # repo_id는 메타데이터 식별용으로 남겨둡니다 (경로 탐색엔 안 쓰임)
-    repo_id="whwjdqls99/libero_hdfr_lerobot_dataset_depth_latents",
+dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(    repo_id="whwjdqls99/robocasa_pt",
     
     # [핵심] root를 'meta 폴더가 들어있는' 데이터셋 폴더 전체 경로로 지정하세요!
-    root="/scratch2/whwjdqls99/libero/whwjdqls99/libero_hdfr_lerobot_dataset_depth_latents",
+    root="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",)
+print("dataset_meta:", dataset_meta)
+print(dataset_meta.episodes)
+dataset = lerobot_dataset.LeRobotDataset(
+    # repo_id는 메타데이터 식별용으로 남겨둡니다 (경로 탐색엔 안 쓰임)
+    # repo_id="whwjdqls99/libero_hdfr_lerobot_dataset_depth_latents",
+    repo_id="whwjdqls99/robocasa_pt",
+    # [핵심] root를 'meta 폴더가 들어있는' 데이터셋 폴더 전체 경로로 지정하세요!
+    root="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
     
     delta_timestamps={
-        "actions": [t / 10 for t in range(50)], 
-        "depth_latent": [(t) / 10 for t in range(51)]
+        "actions": [t / 20 for t in range(50)], 
+        "point_cloud": [(t) / 20 for t in range(51)]
     },
 )
 
@@ -61,7 +66,7 @@ total_points = []
 # print(len(loader))
 print(loader.dataset.meta.stats)
 for i, batch in enumerate(loader):
-    print("depth_image shape:", batch["depth_latent"].shape)
+    print("point_cloud shape:", batch["point_cloud"].shape)
     print("actions shape:", batch["actions"].shape)
 exit()
 for i, batch in enumerate(loader):

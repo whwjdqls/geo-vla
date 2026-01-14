@@ -20,7 +20,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         precision: Literal["bfloat16", "float32"] = "bfloat16",
     ):
         if use_adarms is None:
-            use_adarms = [False, False]
+            use_adarms = [False, False, False]
         super().__init__()
 
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
@@ -67,8 +67,10 @@ class PaliGemmaWithExpertModel(nn.Module):
                 vocab_size=257152,
                 hidden_activation="gelu_pytorch_tanh",
                 torch_dtype="float32",
-                use_adarms=False,
-                adarms_cond_dim=None,
+                # use_adarms=False,
+                # adarms_cond_dim=None,
+                use_adarms=use_adarms[2],
+                adarms_cond_dim=aux_expert_config.width if use_adarms[2] else None,
             )
             self.aux_expert = GemmaForCausalLM(config=aux_expert_config_hf)
             self.aux_expert.model.embed_tokens = None
@@ -121,7 +123,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         adarms_cond: list[torch.Tensor] | None = None,
     ):
         if adarms_cond is None:
-            adarms_cond = [None, None]
+            adarms_cond = [None, None, None]
             
         ### forward only the language model
         if inputs_embeds[1] is None: # only prefix
@@ -154,7 +156,7 @@ class PaliGemmaWithExpertModel(nn.Module):
             
         # this is when only the prefix and suffix are used (no aux expert)
         elif inputs_embeds[0] is not None and inputs_embeds[1] is not None and inputs_embeds[2] is None:
-            input_embeds = [inputs_embeds[0], inputs_embeds[1]]
+            inputs_embeds = [inputs_embeds[0], inputs_embeds[1]]
             
             models = [self.paligemma.language_model, self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
@@ -315,6 +317,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         elif inputs_embeds[0] is not None and inputs_embeds[1] is not None and inputs_embeds[2] is not None:
             # when aux expert is used
             assert self.aux_expert is not None, "Aux expert model is not initialized."
+            assert adarms_cond is not None and len(adarms_cond) == 3, "adarms_cond must be provided for all three models."
             
             models_for_norm = [self.paligemma.language_model, self.gemma_expert.model, self.aux_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
@@ -514,22 +517,22 @@ class PaliGemmaWithExpertModel(nn.Module):
             else:
                 outputs_embeds = compute_final_norms(inputs_embeds, adarms_cond)
 
-            # final norm
-            # Define final norm computation function for gradient checkpointing
-            def compute_final_norms(inputs_embeds, adarms_cond):
-                outputs_embeds = []
-                for i, hidden_states in enumerate(inputs_embeds):
-                    out_emb, _ = models_for_norm[i].norm(hidden_states, cond=adarms_cond[i] if i < 2 else None)
-                    outputs_embeds.append(out_emb)
-                return outputs_embeds
+            # # final norm
+            # # Define final norm computation function for gradient checkpointing
+            # def compute_final_norms(inputs_embeds, adarms_cond):
+            #     outputs_embeds = []
+            #     for i, hidden_states in enumerate(inputs_embeds):
+            #         out_emb, _ = models_for_norm[i].norm(hidden_states, cond=adarms_cond[i] if i < 2 else None)
+            #         outputs_embeds.append(out_emb)
+            #     return outputs_embeds
 
-            # Apply gradient checkpointing to final norm if enabled
-            if use_gradient_checkpointing:
-                outputs_embeds = torch.utils.checkpoint.checkpoint(
-                    compute_final_norms, inputs_embeds, adarms_cond, use_reentrant=False, preserve_rng_state=False
-                )
-            else:
-                outputs_embeds = compute_final_norms(inputs_embeds, adarms_cond)
+            # # Apply gradient checkpointing to final norm if enabled
+            # if use_gradient_checkpointing:
+            #     outputs_embeds = torch.utils.checkpoint.checkpoint(
+            #         compute_final_norms, inputs_embeds, adarms_cond, use_reentrant=False, preserve_rng_state=False
+            #     )
+            # else:
+            #     outputs_embeds = compute_final_norms(inputs_embeds, adarms_cond)
 
             prefix_output = outputs_embeds[0]
             suffix_output = outputs_embeds[1]

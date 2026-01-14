@@ -152,11 +152,11 @@ def create_torch_dataset(
         import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
         print("Using local data for LeRobotDataset, reloading module.")
         dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.root_dir)
-        print("dataset_meta:", dataset_meta)
+        # print("dataset_meta:", dataset_meta)
     else:
         import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
         dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-        print("dataset_meta:", dataset_meta)
+        # print("dataset_meta:", dataset_meta)
         
     delta_timestamps = {
         key: (

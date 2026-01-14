@@ -124,7 +124,7 @@ class Normalize(DataTransformFn):
     def __post_init__(self):
         if self.norm_stats is not None and self.use_quantiles:
             _assert_quantile_stats(self.norm_stats)
-        print("[TRANSFORM] Normalize transform created.", self.norm_stats)
+        # print("[TRANSFORM] Normalize transform created.", self.norm_stats)
     def __call__(self, data: DataDict) -> DataDict:
         if self.norm_stats is None:
             return data

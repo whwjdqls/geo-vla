@@ -129,31 +129,49 @@ class PI0Pytorch(nn.Module):
         else:
             aux_expert_config = None
         self.aux_dim = aux_expert_config.aux_dim if aux_expert_config is not None else 0
-            
+        
+        self.condition_aux_on_timestep = config.condition_aux_on_timestep
+        # if condition_aux_on_timestep is true, aux expert CANNOT USE FLOWMATCHING
+        # this is because we only condition on regression models
+        assert not (self.condition_aux_on_timestep and config.use_flow_matching), "condition_aux_on_timestep and use_flow_matching cannot be both true."
+        
+        use_adarms = [False, True] if self.pi05 else [False, False]
+        if config.aux_expert_type in ["point", "depth"]:
+            if self.config.use_flow_matching:
+                use_adarms.append(True)  # use adaRMSNorm for flow matching aux expert
+            else:
+                use_adarms.append(False) # no adaRMSNorm for regression aux expert
+                
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
             action_expert_config,
             aux_expert_config, 
             aux_expert_type=config.aux_expert_type, # pass aux_expert_type to the model
-            use_adarms=[False, True] if self.pi05 else [False, False],
+            # use_adarms=[False, True] if self.pi05 else [False, False],
+            use_adarms=use_adarms,
             precision=config.dtype,
         )
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)
 
-        if config.aux_expert_type == "point":
+        self.use_flow_matching = config.use_flow_matching # this is for the aux head
+        if config.aux_expert_type in ["point", "depth"]:
             self.aux_in_proj = nn.Linear(self.aux_dim, aux_expert_config.width)
             self.aux_out_proj = nn.Linear(aux_expert_config.width, self.aux_dim)
-            # for point we use regression so we use learnable query tokens
-            self.aux_query_tokens = nn.Parameter(torch.zeros(1, self.config.action_horizon, aux_expert_config.width))
-        elif config.aux_expert_type == "depth":
-            # Depth latents are represented as a single 1024-d token per timestep (16*16*4).
-            self.aux_in_proj = nn.Linear(self.aux_dim, aux_expert_config.width)
-            self.aux_out_proj = nn.Linear(aux_expert_config.width, self.aux_dim)
-            # Regression over future depth-latent tokens.
-            self.aux_query_tokens = nn.Parameter(torch.zeros(1, self.config.action_horizon, aux_expert_config.width))
-
+            if not config.use_flow_matching:
+                # for regression tasks, we use learnable query tokens
+                self.aux_query_tokens = nn.Parameter(torch.zeros(1, self.config.action_horizon, aux_expert_config.width))
+                if self.condition_aux_on_timestep:
+                    # project adarms_cond to use it for aux expert
+                    self.adarms_cond_to_aux = nn.Linear(action_expert_config.width, aux_expert_config.width)
+            else:
+                self.aux_query_tokens = None
+            # else: # we use the same time_embeding after MLP as the main action head
+            #     self.aux_time_mlp_in = nn.Linear(aux_expert_config.width, aux_expert_config.width)
+            #     self.aux_time_mlp_out = nn.Linear(aux_expert_config.width, aux_expert_config.width)
+                
+                
         # # Optional training-only auxiliary head.
         # # This is intentionally lightweight and can be disabled by setting aux_loss_weight=0.
         # self.aux_loss_weight = float(getattr(config, "aux_loss_weight", 0.0))
@@ -411,7 +429,13 @@ class PI0Pytorch(nn.Module):
         # (Bs, 10)
         return embs, pad_masks, att_masks, adarms_cond
     
-    def embed_aux(self, aux_input, aux_target):
+    def embed_aux(self, aux_input, aux_target, BS, device, aux_x_t=None, adarms_cond=None) :
+        
+        if aux_input is None or aux_target is None:
+            embs = None
+            aux_pad_masks = torch.empty(BS, 0, dtype=torch.bool, device=device)
+            aux_att_masks = torch.empty(BS, 0, dtype=torch.bool, device=device)
+            return embs, aux_pad_masks, aux_att_masks
         
         embs = []
         pad_masks = []
@@ -431,16 +455,31 @@ class PI0Pytorch(nn.Module):
             embs.append(aux_input_proj)
             
             # use learnable query tokens for point cloud regression
-            aux_query_tokens = self.aux_query_tokens.expand(bsize, self.config.action_horizon, -1) # (BS, 1, width)
-            embs.append(aux_query_tokens)
+            if self.aux_query_tokens is not None:
+                
+                if self.condition_aux_on_timestep: # condition aux expert on action expert timestep
+                    assert adarms_cond is not None, "adarms_cond must be provided when conditioning aux on timestep."
+                    # project adarms_cond to use it for aux expert
+                    def adarms_cond_to_aux(adarms_cond):
+                        return self.adarms_cond_to_aux(adarms_cond)
+                    adarms_cond_proj = self._apply_checkpoint(adarms_cond_to_aux, adarms_cond) # (BS, width)
+                    embs.append(adarms_cond_proj[:, None, :]) # (BS, 1, width)
+                    
+                aux_query_tokens = self.aux_query_tokens.expand(bsize, self.config.action_horizon, -1) # (BS, 1, width)
+                embs.append(aux_query_tokens)
+            else: # aux_query_tokens is NONE
+                assert aux_x_t is not None, "aux_x_t must be provided when using flow matching."
+                # project aux_x_t to get query tokens
+                aux_x_t_proj = self._apply_checkpoint(aux_in_proj_func, aux_x_t) # (BS, T, width)
+                embs.append(aux_x_t_proj)
             
-            # all auxilary inputs are valid
-            aux_pad_masks = torch.ones(aux_target.shape[0], 1 + aux_target.shape[1], dtype=torch.bool, device=aux_target.device)
-            pad_masks.append(aux_pad_masks)
+            # # all auxilary inputs are valid
+            # aux_pad_masks = torch.ones(aux_target.shape[0], 1 + aux_target.shape[1], dtype=torch.bool, device=aux_target.device)
+            # pad_masks.append(aux_pad_masks)
             
-            # 2d attention will be updated anyways so this is a place holder for the sake of compatibility
-            aux_att_masks = torch.zeros(aux_target.shape[0], 1 + aux_target.shape[1], dtype=torch.bool, device=aux_target.device)
-            att_masks.append(aux_att_masks)
+            # # 2d attention will be updated anyways so this is a place holder for the sake of compatibility
+            # aux_att_masks = torch.zeros(aux_target.shape[0], 1 + aux_target.shape[1], dtype=torch.bool, device=aux_target.device)
+            # att_masks.append(aux_att_masks)
             
         elif self.config.aux_expert_type == "depth":
             # depth auxiliary expert
@@ -455,35 +494,53 @@ class PI0Pytorch(nn.Module):
             aux_input_proj = self._apply_checkpoint(aux_in_proj_func, aux_input)  # (BS, 1, width)
             embs.append(aux_input_proj)
 
-            # Learnable query tokens for future depth forecasting.
-            aux_query_tokens = self.aux_query_tokens.expand(bsize, self.config.action_horizon, -1)
-            embs.append(aux_query_tokens)
+            if self.aux_query_tokens is not None:
+                
+                if self.condition_aux_on_timestep: # condition aux expert on action expert timestep
+                    assert adarms_cond is not None, "adarms_cond must be provided when conditioning aux on timestep."
+                    # project adarms_cond to use it for aux expert
+                    def adarms_cond_to_aux(adarms_cond):
+                        return self.adarms_cond_to_aux(adarms_cond)
+                    adarms_cond_proj = self._apply_checkpoint(adarms_cond_to_aux, adarms_cond) # (BS, width)
+                    embs.append(adarms_cond_proj[:, None, :]) # (BS, 1, width)
+                    
+                    
+                # Learnable query tokens for future depth forecasting.
+                aux_query_tokens = self.aux_query_tokens.expand(bsize, self.config.action_horizon, -1)
+                embs.append(aux_query_tokens)
+            else:
+                assert aux_x_t is not None, "aux_x_t must be provided when using flow matching."
+                # project aux_x_t to get query tokens
+                aux_x_t_proj = self._apply_checkpoint(aux_in_proj_func, aux_x_t) # (BS, T, width)
+                embs.append(aux_x_t_proj)
 
-            aux_pad_masks = torch.ones(
-                bsize,
-                1 + self.config.action_horizon,
-                dtype=torch.bool,
-                device=aux_target.device,
-            )
-            pad_masks.append(aux_pad_masks)
+            # aux_pad_masks = torch.ones(
+            #     bsize,
+            #     1 + self.config.action_horizon,
+            #     dtype=torch.bool,
+            #     device=aux_target.device,
+            # )
+            # pad_masks.append(aux_pad_masks)
 
-            aux_att_masks = torch.zeros(
-                bsize,
-                1 + self.config.action_horizon,
-                dtype=torch.bool,
-                device=aux_target.device,
-            )
-            att_masks.append(aux_att_masks)
+            # aux_att_masks = torch.zeros(
+            #     bsize,
+            #     1 + self.config.action_horizon,
+            #     dtype=torch.bool,
+            #     device=aux_target.device,
+            # )
+            # att_masks.append(aux_att_masks)
         else:
             raise ValueError(f"Unknown auxiliary expert type: {self.config.aux_expert_type}")
         
         embs = torch.cat(embs, dim=1)
-        pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.cat(att_masks, dim=1)
+        # pad_masks = torch.cat(pad_masks, dim=1)
+        # att_masks = torch.cat(att_masks, dim=1)
+        pad_masks = torch.ones(embs.shape[0], embs.shape[1], dtype=torch.bool, device=embs.device)
+        att_masks = torch.zeros(embs.shape[0], embs.shape[1], dtype=torch.bool, device=embs.device)
         
         return embs, pad_masks, att_masks
     
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
+    def forward(self, observation, actions, noise=None, time=None, aux_noise=None, return_aux=False) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         # observation.state (B, state_dim)
         # observation.images
@@ -507,7 +564,7 @@ class PI0Pytorch(nn.Module):
             aux_input = input_point_cloud.reshape(input_point_cloud.shape[0], input_point_cloud.shape[1], -1) # input_point_cloud: (BS, 1, N, D) -> aux_input (BS, 1, N*D)
             aux_target = output_point_delta.reshape(output_point_delta.shape[0], output_point_delta.shape[1], -1) # output_point_delta: (BS, T, N, D) -> aux_target (BS, T, N*D)
 
-            aux_embs, aux_pad_masks, aux_att_masks = self.embed_aux(aux_input, aux_target)
+            # aux_embs, aux_pad_masks, aux_att_masks = self.embed_aux(aux_input, aux_target)
 
         elif hasattr(observation, "depth_image") and observation.depth_image is not None and self.config.aux_expert_type == "depth":
             input_depth_token, target_depth_tokens = self._preprocess_depth(observation.depth_image, train=True)
@@ -516,29 +573,47 @@ class PI0Pytorch(nn.Module):
             )
             aux_input = input_depth_token  # (BS, 1, 1024)
             aux_target = target_depth_tokens  # (BS, T, 1024)
-            aux_embs, aux_pad_masks, aux_att_masks = self.embed_aux(aux_input, aux_target)
+            # aux_embs, aux_pad_masks, aux_att_masks = self.embed_aux(aux_input, aux_target)
         else:
-            print("hasattr(observation, 'point_cloud'):", hasattr(observation, "point_cloud"))
-            print("observation.point_cloud is None:", observation.point_cloud is None if hasattr(observation, "point_cloud") else "N/A")
-            print("No auxiliary expert input found. aux_embs is NONE")
-            aux_embs = None
+            # print("hasattr(observation, 'point_cloud'):", hasattr(observation, "point_cloud"))
+            # print("observation.point_cloud is None:", observation.point_cloud is None if hasattr(observation, "point_cloud") else "N/A")
+            # print("No auxiliary expert input found. aux_embs is NONE")
+            # aux_embs = None
+            aux_input = None
             aux_target = None
-            aux_pad_masks = torch.empty(state.shape[0], 0, dtype=torch.bool, device=state.device)
-            aux_att_masks = torch.empty(state.shape[0], 0, dtype=torch.bool, device=state.device)
+            # aux_pad_masks = torch.empty(state.shape[0], 0, dtype=torch.bool, device=state.device)
+            # aux_att_masks = torch.empty(state.shape[0], 0, dtype=torch.bool, device=state.device)
         
         
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
+            
+        if aux_noise is None:
+            aux_noise = self.sample_noise(aux_target.shape, aux_target.device) if aux_target is not None else None
 
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
 
         time_expanded = time[:, None, None]
+        
+        
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
+        if self.config.use_flow_matching:
+            aux_x_t = time_expanded * aux_noise + (1 - time_expanded) * aux_target if aux_target is not None else None
+            aux_u_t = aux_noise - aux_target if aux_target is not None else None
+            aux_target = aux_u_t  # for flow matching, the target is the velocity field
+        else:
+            aux_x_t = None
+        
+        
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        aux_embs, aux_pad_masks, aux_att_masks = self.embed_aux(aux_input, aux_target, state.shape[0], state.device, \
+            aux_x_t=aux_x_t, \
+            adarms_cond=adarms_cond if self.condition_aux_on_timestep else None)
+        
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -590,7 +665,7 @@ class PI0Pytorch(nn.Module):
                 past_key_values=None,
                 inputs_embeds=[prefix_embs, suffix_embs, aux_embs],
                 use_cache=False,
-                adarms_cond=[None, adarms_cond, None],
+                adarms_cond=[None, adarms_cond, adarms_cond] if self.use_flow_matching else [None, adarms_cond, None],
             )
             return suffix_out, aux_out
 
@@ -610,7 +685,7 @@ class PI0Pytorch(nn.Module):
             aux_loss = F.mse_loss(aux_pred, aux_target, reduction="mean")  # scalar
             # aux_loss = aux_loss * self.config.aux_loss_weight
         else:
-            aux_loss = 0.0
+            aux_loss = torch.tensor(0.0, device=state.device) # for compatibility
             
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)

@@ -27,6 +27,8 @@ class Pi0Config(_model.BaseModelConfig):
     depth_expert_variant: _gemma.Variant | None = "depth_head_v1"
     depth_encoder_ckpt: str | None = None  # path to depth encoder checkpoint for depth expert
     allow_aux_to_attend_suffix: bool = False  # whether to allow auxiliary expert to attend to suffix tokens
+    use_flow_matching: bool = False  # whether to use flow matching loss for aux expert
+    condition_aux_on_timestep: bool = False  # whether to condition aux expert on action expert timestep
     # Set the model specific defaults.
     action_dim: int = 32
     action_horizon: int = 50

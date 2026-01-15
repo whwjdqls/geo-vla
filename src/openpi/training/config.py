@@ -201,13 +201,16 @@ class DataConfigFactory(abc.ABC):
             return None
         try:
             data_assets_dir = str(assets_dir / asset_id)
+            print(f"[DEBUG] Attempting to load norm stats from: {data_assets_dir}")
+            print(f"[DEBUG] Full path: {epath.Path(data_assets_dir).resolve()}")
             norm_stats = _normalize.load(_download.maybe_download(data_assets_dir))
             logging.info(f"Loaded norm stats from {data_assets_dir}")
             print(f"[DATA]Loaded norm stats from {data_assets_dir}")
             return norm_stats
-        except FileNotFoundError:
+        except FileNotFoundError as e:
             logging.info(f"Norm stats not found in {data_assets_dir}, skipping.")
-            print(f"Norm stats not found in {data_assets_dir}, skipping.")
+            print(f"[DEBUG] Norm stats not found in {data_assets_dir}, skipping.")
+            print(f"[DEBUG] FileNotFoundError: {e}")
         return None
 
 
@@ -1155,6 +1158,39 @@ _CONFIGS = [
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
+        checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
+        # aux_loss_weight=0.1,
+    ),
+    TrainConfig( # Full finetuning version of pi05_ours_low_mem_finetune_openvla_libero_pt_v3_attend_action_FM
+        name="pi05_ours_full_finetune_openvla_libero_pt_v3_attend_action_FM",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False,
+                                   aux_expert_type="point",
+                                   point_expert_variant="point_head_v3",
+                                   allow_aux_to_attend_suffix=True,
+                                   use_flow_matching=True,
+                                   condition_aux_on_timestep=False
+                                   ),
+        # use_local_data=True,
+        data=LeRobotLiberoPointTrackDataConfig(
+            # repo_id="physical-intelligence/libero",
+            use_local_data=True,
+            repo_id="whwjdqls99/libero_hdfr_lerobot_track_datasets_w_pt",
+            root_dir="/scratch2/whwjdqls99/libero/libero_hdfr_lerobot_track_datasets_w_pt",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/scratch2/whwjdqls99/pi/pi05_base", # please override this
+        num_train_steps=30_000,
         checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
         # aux_loss_weight=0.1,
     ),

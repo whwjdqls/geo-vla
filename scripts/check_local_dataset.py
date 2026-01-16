@@ -33,18 +33,18 @@ from huggingface_hub import HfApi
 # hub_api.create_tag("whwjdqls99/libero_hdfr_lerobot_dataset_depth", tag="v2.0", repo_type="dataset")
 # # # 1. Do NOT set HF_HUB_OFFLINE to 1, or the download will fail.
 # # # (If you previously set it in this script, delete that line or set it to '0')
-dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(    repo_id="whwjdqls99/robocasa_pt",
+dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(    repo_id="whwjdqls99/robocasa_pt",)
     
     # [핵심] root를 'meta 폴더가 들어있는' 데이터셋 폴더 전체 경로로 지정하세요!
-    root="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",)
+    # root="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",)
 print("dataset_meta:", dataset_meta)
-print(dataset_meta.episodes)
+# print(dataset_meta.episodes)
 dataset = lerobot_dataset.LeRobotDataset(
     # repo_id는 메타데이터 식별용으로 남겨둡니다 (경로 탐색엔 안 쓰임)
     # repo_id="whwjdqls99/libero_hdfr_lerobot_dataset_depth_latents",
     repo_id="whwjdqls99/robocasa_pt",
     # [핵심] root를 'meta 폴더가 들어있는' 데이터셋 폴더 전체 경로로 지정하세요!
-    root="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
+    # root="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
     
     delta_timestamps={
         "actions": [t / 20 for t in range(50)], 
@@ -60,14 +60,15 @@ loader = DataLoader(
     dataset,
     batch_size=2,     # 먼저 1~2로 확인하는 게 좋음
     shuffle=False,
-    num_workers=8,    # 디버깅할 땐 0 추천
+    num_workers=4,    # 디버깅할 땐 0 추천
 )
 total_points = []
 # print(len(loader))
 print(loader.dataset.meta.stats)
 for i, batch in enumerate(loader):
-    print("point_cloud shape:", batch["point_cloud"].shape)
-    print("actions shape:", batch["actions"].shape)
+    if i % 100 == 0:
+        print("point_cloud shape:", batch["point_cloud"].shape)
+        print("actions shape:", batch["actions"].shape)
 exit()
 for i, batch in enumerate(loader):
     if i == 100:

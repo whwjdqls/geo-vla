@@ -1414,8 +1414,8 @@ _CONFIGS = [
                                    ),
         # use_local_data=True,
         data=LeRobotRobocasaPointTrackDataConfig(
-            use_local_data=True,
-            root_dir="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
+            # use_local_data=True,
+            # root_dir="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
             repo_id="whwjdqls99/robocasa_pt",
             base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
             extra_delta_transform=False, # robocasa actions are already delta
@@ -1451,8 +1451,8 @@ _CONFIGS = [
                                    ),
         # use_local_data=True,
         data=LeRobotRobocasaPointTrackDataConfig(
-            use_local_data=True,
-            root_dir="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
+            # use_local_data=True,
+            # root_dir="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
             repo_id="whwjdqls99/robocasa_pt",
             base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
             extra_delta_transform=False, # robocasa actions are already delta
@@ -1488,8 +1488,8 @@ _CONFIGS = [
                                    ),
         # use_local_data=True,
         data=LeRobotRobocasaPointTrackDataConfig(
-            use_local_data=True,
-            root_dir="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
+            # use_local_data=True,
+            # root_dir="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
             repo_id="whwjdqls99/robocasa_pt",
             base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
             extra_delta_transform=False, # robocasa actions are already delta
@@ -1524,8 +1524,8 @@ _CONFIGS = [
                                    ),
         # use_local_data=True,
         data=LeRobotRobocasaPointTrackDataConfig(
-            use_local_data=True,
-            root_dir="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
+            # use_local_data=True,
+            # root_dir="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
             repo_id="whwjdqls99/robocasa_pt",
             base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
             extra_delta_transform=False, # robocasa actions are already delta

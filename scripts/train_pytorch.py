@@ -98,6 +98,7 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
         return
 
     ckpt_dir = config.checkpoint_dir
+    print("ckpt_dir:", ckpt_dir)
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
 

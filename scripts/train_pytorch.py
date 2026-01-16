@@ -43,6 +43,7 @@ import torch.distributed as dist
 import torch.nn.parallel
 import tqdm
 import wandb
+from torch.utils.tensorboard import SummaryWriter
 
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
@@ -110,6 +111,19 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
             project=config.project_name,
         )
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+
+
+def init_tensorboard(config: _config.TrainConfig, enabled: bool = True):
+    """Initialize tensorboard logging."""
+    if not enabled:
+        return None
+    
+    tb_log_dir = config.checkpoint_dir / "tensorboard"
+    tb_log_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=str(tb_log_dir))
+    logging.info(f"Tensorboard logging to: {tb_log_dir}")
+    print(f"[INFO] Tensorboard logging to: {tb_log_dir}")
+    return writer
 
 
 def setup_ddp():
@@ -389,9 +403,11 @@ def train_loop(config: _config.TrainConfig):
         # For resume, checkpoint_dir is already set to the experiment directory
         logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
 
-    # Initialize wandb (only on main process)
+    # Initialize wandb and tensorboard (only on main process)
+    tb_writer = None
     if is_main:
         init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+        tb_writer = init_tensorboard(config, enabled=True)
 
     # Build data loader using the unified data loader
     # Calculate effective batch size per GPU for DDP
@@ -681,8 +697,8 @@ def train_loop(config: _config.TrainConfig):
                     f"data_time={avg_data_time:.3f}s compute_time={avg_compute_time:.3f}s time={elapsed:.1f}s"
                 )
 
-                # Log to wandb
-                if config.wandb_enabled and len(infos) > 0:
+                # Log to wandb and tensorboard
+                if len(infos) > 0:
                     log_payload = {
                         "loss":     avg_loss,
                         "aux_loss": avg_aux_loss,
@@ -694,7 +710,21 @@ def train_loop(config: _config.TrainConfig):
                     }
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
-                    wandb.log(log_payload, step=global_step)
+                    
+                    # Log to wandb
+                    if config.wandb_enabled:
+                        wandb.log(log_payload, step=global_step)
+                    
+                    # Log to tensorboard
+                    if tb_writer is not None:
+                        tb_writer.add_scalar("train/loss", avg_loss, global_step)
+                        tb_writer.add_scalar("train/aux_loss", avg_aux_loss, global_step)
+                        tb_writer.add_scalar("train/learning_rate", avg_lr, global_step)
+                        tb_writer.add_scalar("train/time_per_step", elapsed / config.log_interval, global_step)
+                        tb_writer.add_scalar("train/data_time", avg_data_time, global_step)
+                        tb_writer.add_scalar("train/compute_time", avg_compute_time, global_step)
+                        if avg_grad_norm is not None:
+                            tb_writer.add_scalar("train/grad_norm", avg_grad_norm, global_step)
 
                 start_time = time.time()
                 infos = []  # Reset stats collection
@@ -715,9 +745,13 @@ def train_loop(config: _config.TrainConfig):
     if pbar is not None:
         pbar.close()
 
-    # Finish wandb run
-    if is_main and config.wandb_enabled:
-        wandb.finish()
+    # Finish wandb run and close tensorboard
+    if is_main:
+        if config.wandb_enabled:
+            wandb.finish()
+        if tb_writer is not None:
+            tb_writer.close()
+            logging.info("Closed tensorboard writer")
 
     cleanup_ddp()
 

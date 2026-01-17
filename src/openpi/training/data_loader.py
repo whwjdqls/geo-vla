@@ -4,6 +4,7 @@ import multiprocessing
 import os
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
+from PIL import UnidentifiedImageError
 
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
@@ -58,13 +59,68 @@ class DataLoader(Protocol[T_co]):
         raise NotImplementedError("Subclasses of DataLoader should implement __iter__.")
 
 
+# class TransformedDataset(Dataset[T_co]):
+#     def __init__(self, dataset: Dataset, transforms: Sequence[_transforms.DataTransformFn]):
+#         self._dataset = dataset
+#         self._transform = _transforms.compose(transforms)
+
+#     def __getitem__(self, index: SupportsIndex) -> T_co:
+#         return self._transform(self._dataset[index])
+
+#     def __len__(self) -> int:
+#         return len(self._dataset)
+
 class TransformedDataset(Dataset[T_co]):
-    def __init__(self, dataset: Dataset, transforms: Sequence[_transforms.DataTransformFn]):
+    def __init__(
+        self,
+        dataset: Dataset,
+        transforms: Sequence[_transforms.DataTransformFn],
+        *,
+        skip_bad_samples: bool = False,
+        max_skip_tries: int = 50,
+        skip_strategy: Literal["next", "random"] = "next",
+        seed: int = 0,
+        log_bad_samples_path: str | None = None,
+    ):
         self._dataset = dataset
         self._transform = _transforms.compose(transforms)
 
+        self._skip_bad_samples = skip_bad_samples
+        self._max_skip_tries = max_skip_tries
+        self._skip_strategy = skip_strategy
+        self._rng = np.random.default_rng(seed)
+        self._log_bad_samples_path = log_bad_samples_path
+
     def __getitem__(self, index: SupportsIndex) -> T_co:
-        return self._transform(self._dataset[index])
+        if not self._skip_bad_samples:
+            return self._transform(self._dataset[index])
+
+        n = len(self._dataset)
+        idx0 = int(index.__index__())
+        last_exc: Exception | None = None
+
+        for k in range(self._max_skip_tries):
+            if self._skip_strategy == "next":
+                idx = (idx0 + k) % n
+            else:  # "random"
+                idx = int(self._rng.integers(0, n))
+
+            try:
+                return self._transform(self._dataset[idx])
+            except (UnidentifiedImageError, OSError, ValueError) as e:
+                last_exc = e
+                if self._log_bad_samples_path is not None:
+                    try:
+                        with open(self._log_bad_samples_path, "a") as f:
+                            f.write(f"{idx}\t{type(e).__name__}\t{str(e).replace(chr(9),' ')}\n")
+                    except Exception:
+                        pass
+                continue
+
+        raise RuntimeError(
+            f"Too many bad samples encountered starting from idx={idx0}. "
+            f"Last error: {type(last_exc).__name__ if last_exc else 'None'}: {last_exc}"
+        )
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -238,6 +294,11 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ],
+        skip_bad_samples=True,
+        max_skip_tries=50,
+        skip_strategy="next",  # or "random"
+        seed=0,
+        log_bad_samples_path=f"./bad_samples_rank{os.environ.get('RANK','0')}.tsv",
     )
 
 

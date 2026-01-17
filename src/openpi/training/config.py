@@ -1407,15 +1407,15 @@ _CONFIGS = [
         checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
         # aux_loss_weight=0.1,
     ),
-    TrainConfig( # this is a point track head with bigger point expert
+    TrainConfig( # this is base model finetuned with lora
         name="pi05_robocasa_pt",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False,
                                    paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
                                    ),
         # use_local_data=True,
         data=LeRobotRobocasaPointTrackDataConfig(
-            use_local_data=True,
-            root_dir="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
+            # use_local_data=True,
+            # root_dir="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
             repo_id="whwjdqls99/robocasa_pt",
             base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
             extra_delta_transform=False, # robocasa actions are already delta
@@ -1443,6 +1443,7 @@ _CONFIGS = [
     TrainConfig( # this is a point track head with bigger point expert
         name="pi05_robocasa_pt_v3_attend_action_fm",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False,
+                                   paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
                                    aux_expert_type="point",
                                    point_expert_variant="point_head_v3",
                                    allow_aux_to_attend_suffix=True,
@@ -1451,8 +1452,8 @@ _CONFIGS = [
                                    ),
         # use_local_data=True,
         data=LeRobotRobocasaPointTrackDataConfig(
-            use_local_data=True,
-            root_dir="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
+            # use_local_data=True,
+            # root_dir="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
             repo_id="whwjdqls99/robocasa_pt",
             base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
             extra_delta_transform=False, # robocasa actions are already delta
@@ -1480,6 +1481,7 @@ _CONFIGS = [
     TrainConfig( # this is a point track head with bigger point expert
         name="pi05_robocasa_pt_v3_attend_action_cond_T",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False,
+                                   paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
                                    aux_expert_type="point",
                                    point_expert_variant="point_head_v3",
                                    allow_aux_to_attend_suffix=True,
@@ -1488,8 +1490,8 @@ _CONFIGS = [
                                    ),
         # use_local_data=True,
         data=LeRobotRobocasaPointTrackDataConfig(
-            use_local_data=True,
-            root_dir="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
+            # use_local_data=True,
+            # root_dir="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
             repo_id="whwjdqls99/robocasa_pt",
             base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
             extra_delta_transform=False, # robocasa actions are already delta
@@ -1524,8 +1526,8 @@ _CONFIGS = [
                                    ),
         # use_local_data=True,
         data=LeRobotRobocasaPointTrackDataConfig(
-            use_local_data=True,
-            root_dir="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
+            # use_local_data=True,
+            # root_dir="/scratch2/whwjdqls99/robocasa/whwjdqls99/robocasa_pt",
             repo_id="whwjdqls99/robocasa_pt",
             base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
             extra_delta_transform=False, # robocasa actions are already delta
@@ -1561,7 +1563,7 @@ _CONFIGS = [
         # use_local_data=True,
         data=LeRobotRobocasaPointTrackDataConfig(
             # repo_id="physical-intelligence/libero",
-            repo_id="whwjdqls99/robocasa_lerobot",
+            repo_id="whwjdqls99/robocasa_pt",
             base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
             extra_delta_transform=False, # robocasa actions are already delta
         ),
@@ -1585,6 +1587,62 @@ _CONFIGS = [
         checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
         # aux_loss_weight=0.1,
     ),
+    TrainConfig( # this is a point track head with bigger point expert
+        name="pi05_robocasa_pt_full",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False,),
+        # use_local_data=True,
+        data=LeRobotRobocasaPointTrackDataConfig(
+            # repo_id="physical-intelligence/libero",
+            repo_id="whwjdqls99/robocasa_pt",
+            base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
+            extra_delta_transform=False, # robocasa actions are already delta
+        ),
+        # batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/scratch2/whwjdqls99/pi/pi05_base", # please override this
+        num_train_steps=30_000,
+        checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
+    ),
+    
+    TrainConfig( # this is a point track head with bigger point expert pi05_ours_full_finetune_openvla_libero_pt_v3_attend_action_FM
+        name="pi05_robocasa_pt_full_pt_v3_attend_action_FM",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False,
+                                   aux_expert_type="point",
+                                   point_expert_variant="point_head_v3",
+                                   allow_aux_to_attend_suffix=True,
+                                   use_flow_matching=True,
+                                   condition_aux_on_timestep=False
+                                   ),
+        # use_local_data=True,
+        data=LeRobotRobocasaPointTrackDataConfig(
+            # repo_id="physical-intelligence/libero",
+            repo_id="whwjdqls99/robocasa_pt",
+            base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
+            extra_delta_transform=False, # robocasa actions are already delta
+        ),
+        # batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/scratch2/whwjdqls99/pi/pi05_base", # please override this
+        num_train_steps=30_000,
+        checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
+    ),
+
     #
     # Fine-tuning Libero configs.
     #
@@ -1687,6 +1745,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_libero_full_ft_openvla_libero",
+        
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(
             repo_id="whwjdqls99/libero_hdfr_lerobot_track_datasets",

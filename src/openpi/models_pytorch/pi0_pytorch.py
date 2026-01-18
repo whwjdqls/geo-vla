@@ -188,7 +188,11 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        # NOTE: Do not eagerly torch.compile() here.
+        # The model is typically moved to the target device (e.g. CUDA) after construction.
+        # Compiling while parameters are still on CPU can lead to Dynamo device propagation
+        # errors later when calling the compiled function on CUDA.
+        self._sample_actions_compiled = False
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -203,6 +207,16 @@ class PI0Pytorch(nn.Module):
             raise ValueError(msg) from None
         
         self.stats = None
+
+    def compile_sample_actions(self, *, mode: str = "max-autotune") -> None:
+        """Optionally compile `sample_actions` after the model is on the target device."""
+        if self._sample_actions_compiled:
+            return
+        # Only compile if torch.compile exists (PyTorch 2.x) and Dynamo is available.
+        if not hasattr(torch, "compile"):
+            return
+        self.sample_actions = torch.compile(self.sample_actions, mode=mode)
+        self._sample_actions_compiled = True
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -794,3 +808,237 @@ class PI0Pytorch(nn.Module):
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)
+
+
+    @torch.no_grad()
+    def predict_actions_and_point_tracks(
+        self,
+        device: torch.device,
+        observation,
+        *,
+        num_action_steps: int = 10,
+        num_aux_steps: int = 10,
+        norm_bug: bool = False,
+    ):
+        """Predict actions and point tracks (as per-step point deltas) for visualization.
+
+        Returns:
+          actions_pred: (B, action_horizon, action_dim)
+          p0: (B, N, 3) raw point cloud at t=0 (sampled to match aux_dim)
+          delta_pred: (B, action_horizon, N, 3) predicted per-step deltas in raw units
+        """
+        if self.config.aux_expert_type != "point":
+            raise ValueError(
+                f"predict_actions_and_point_tracks only supports aux_expert_type='point' (got {self.config.aux_expert_type!r})"
+            )
+        if self.stats is None:
+            raise ValueError("Point cloud stats are not set. Call get_stats_from_loader(...) before inference.")
+        if not hasattr(observation, "point_cloud") or observation.point_cloud is None:
+            raise ValueError("Observation has no point_cloud for point-track visualization.")
+
+        self.eval()
+
+        # 1) Predict actions using the model's existing diffusion sampler.
+        actions_pred = self.sample_actions(device, observation, num_steps=num_action_steps)
+
+        # 2) Prepare prefix/suffix embeddings for aux prediction.
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+
+        # Build point-cloud aux input (sample points so that N*3 == aux_dim).
+        point_cloud = observation.point_cloud
+        if point_cloud.ndim != 4 or point_cloud.shape[-1] != 3:
+            raise ValueError(f"Expected point_cloud shape (B, T, N, 3), got {tuple(point_cloud.shape)}")
+
+        p0_full = point_cloud[:, 0, :, :]  # (B, N, 3) in raw units
+        original_n = p0_full.shape[1]
+        expected_n = self.aux_dim // 3
+        if expected_n <= 0:
+            raise ValueError(f"Invalid aux_dim={self.aux_dim} for point tracks")
+        if original_n % expected_n != 0:
+            raise ValueError(
+                f"Point count {original_n} is not divisible by expected aux points {expected_n} (aux_dim={self.aux_dim})."
+            )
+        sample_stride = original_n // expected_n
+        p0 = p0_full[:, ::sample_stride, :]  # (B, expected_n, 3)
+
+        # Normalize input point cloud using dataset stats (matches preprocess_point_cloud_pytorch behavior).
+        mean = torch.tensor(self.stats["point_cloud"]["mean"], device=p0.device).squeeze().to(p0.dtype)
+        std = torch.tensor(self.stats["point_cloud"]["std"], device=p0.device).squeeze().to(p0.dtype)
+        p0_norm = (p0 - mean) / std
+        aux_input = p0_norm.reshape(p0_norm.shape[0], 1, -1)  # (B, 1, aux_dim)
+
+        bsize = aux_input.shape[0]
+
+        def denorm_deltas(delta_norm: torch.Tensor) -> torch.Tensor:
+            delta_mean = torch.tensor(self.stats["point_cloud"]["delta_mean"], device=delta_norm.device).squeeze().to(
+                delta_norm.dtype
+            )
+            delta_std = torch.tensor(self.stats["point_cloud"]["delta_std"], device=delta_norm.device).squeeze().to(
+                delta_norm.dtype
+            )
+            return (delta_norm * delta_std) + delta_mean
+
+        # 3) Predict normalized deltas (aux head).
+        if not self.use_flow_matching:
+            # Regression aux head: use learnable query tokens; optionally condition on timestep.
+            time = torch.zeros(bsize, dtype=torch.float32, device=device)
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, actions_pred, time)
+
+            dummy_aux_target = torch.zeros(
+                bsize,
+                self.config.action_horizon,
+                self.aux_dim,
+                dtype=aux_input.dtype,
+                device=device,
+            )
+            aux_embs, aux_pad_masks, aux_att_masks = self.embed_aux(
+                aux_input,
+                dummy_aux_target,
+                bsize,
+                device,
+                aux_x_t=None,
+                adarms_cond=adarms_cond if self.condition_aux_on_timestep else None,
+            )
+
+            # Cast to bfloat16 if the backbone runs in bf16.
+            if (
+                self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+                == torch.bfloat16
+            ):
+                prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+                suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+                aux_embs = aux_embs.to(dtype=torch.bfloat16) if aux_embs is not None else None
+
+            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks, aux_pad_masks], dim=1)
+            att_masks = torch.cat([prefix_att_masks, suffix_att_masks, aux_att_masks], dim=1)
+            att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+
+            prefix_len = prefix_embs.shape[1]
+            suffix_len = suffix_embs.shape[1]
+            aux_start = prefix_len + suffix_len
+            aux_end = aux_start + aux_embs.shape[1]
+            att_2d_masks = enforce_aux_attention_masks(
+                att_2d_masks,
+                aux_pad_masks,
+                aux_start,
+                aux_end,
+                prefix_len,
+                suffix_len,
+                allow_aux_to_attend_suffix=self.config.allow_aux_to_attend_suffix,
+            )
+
+            position_ids = torch.cumsum(pad_masks, dim=1) - 1
+            att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+            (outputs_embeds, _) = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs, aux_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond, None],
+            )
+            aux_out = outputs_embeds[2]
+            aux_suffix_out = aux_out[:, -self.config.action_horizon :, :].to(dtype=torch.float32)
+            aux_pred_norm = self.aux_out_proj(aux_suffix_out)  # (B, T, aux_dim)
+
+        else:
+            # Flow matching aux head: Euler-integrate aux deltas while holding actions fixed.
+            # This is meant for visualization/debug and is not optimized.
+            dt = -1.0 / float(num_aux_steps)
+            dt = torch.tensor(dt, dtype=torch.float32, device=device)
+
+            aux_x_t = self.sample_noise((bsize, self.config.action_horizon, self.aux_dim), device)
+
+            time_scalar = torch.tensor(1.0, dtype=torch.float32, device=device)
+
+            # Cache prefix embeds/masks since they don't change across steps.
+            prefix_embs_cached = prefix_embs
+            prefix_pad_masks_cached = prefix_pad_masks
+            prefix_att_masks_cached = prefix_att_masks
+
+            while time_scalar >= -dt / 2:
+                time = time_scalar.expand(bsize)
+                suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, actions_pred, time)
+
+                dummy_aux_target = torch.zeros(
+                    bsize,
+                    self.config.action_horizon,
+                    self.aux_dim,
+                    dtype=aux_x_t.dtype,
+                    device=device,
+                )
+                aux_embs, aux_pad_masks, aux_att_masks = self.embed_aux(
+                    aux_input,
+                    dummy_aux_target,
+                    bsize,
+                    device,
+                    aux_x_t=aux_x_t,
+                    adarms_cond=adarms_cond if self.condition_aux_on_timestep else None,
+                )
+
+                if (
+                    self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+                    == torch.bfloat16
+                ):
+                    prefix_embs_step = prefix_embs_cached.to(dtype=torch.bfloat16)
+                    suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+                    aux_embs = aux_embs.to(dtype=torch.bfloat16) if aux_embs is not None else None
+                else:
+                    prefix_embs_step = prefix_embs_cached
+
+                pad_masks = torch.cat([prefix_pad_masks_cached, suffix_pad_masks, aux_pad_masks], dim=1)
+                att_masks = torch.cat([prefix_att_masks_cached, suffix_att_masks, aux_att_masks], dim=1)
+                att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+
+                prefix_len = prefix_embs_step.shape[1]
+                suffix_len = suffix_embs.shape[1]
+                aux_start = prefix_len + suffix_len
+                aux_end = aux_start + aux_embs.shape[1]
+                att_2d_masks = enforce_aux_attention_masks(
+                    att_2d_masks,
+                    aux_pad_masks,
+                    aux_start,
+                    aux_end,
+                    prefix_len,
+                    suffix_len,
+                    allow_aux_to_attend_suffix=self.config.allow_aux_to_attend_suffix,
+                )
+
+                position_ids = torch.cumsum(pad_masks, dim=1) - 1
+                att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+                (outputs_embeds, _) = self.paligemma_with_expert.forward(
+                    attention_mask=att_2d_masks_4d,
+                    position_ids=position_ids,
+                    past_key_values=None,
+                    inputs_embeds=[prefix_embs_step, suffix_embs, aux_embs],
+                    use_cache=False,
+                    adarms_cond=[None, adarms_cond, adarms_cond],
+                )
+                aux_out = outputs_embeds[2]
+                aux_suffix_out = aux_out[:, -self.config.action_horizon :, :].to(dtype=torch.float32)
+                v_aux = self.aux_out_proj(aux_suffix_out)  # velocity in normalized space
+
+                aux_x_t = aux_x_t + dt * v_aux
+                time_scalar = time_scalar + dt
+
+            aux_pred_norm = aux_x_t
+
+        # 4) Convert to per-point deltas in raw units.
+        delta_pred_norm = aux_pred_norm.reshape(bsize, self.config.action_horizon, expected_n, 3)
+        
+        if not norm_bug: # this is the way it is supposed to be
+            delta_pred = denorm_deltas(delta_pred_norm)
+            point_tracks = p0[:, None, :, :] + torch.cumsum(delta_pred, dim=1)  # (B, T, N, 3)
+        else: # this is when there was a norm bug, where we first get the pts and then denorm
+            point_tracks_norm = p0_norm[:, None, :, :] + torch.cumsum(delta_pred_norm, dim=1)  # (B, T, N, 3)
+            point_tracks = point_tracks_norm * std[None, None, :, :] + mean[None, None, :, :]
+
+        # concat along time dimension
+        point_tracks = torch.cat([p0[:, None, :, :], point_tracks], dim=1)  # (B, T+1, N, 3)
+        
+        # return actions_pred, p0, delta_pred
+        return actions_pred, point_tracks

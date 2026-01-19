@@ -23,7 +23,44 @@ bash ./examples/libero/eval_libero_in_one_v2.sh
 ```
 You can give multiple checkpoints, save videos, change seeds. All the description is in the bash file.
 
+## Evaluate geo-vla-pt on Robocasa
+### Setting Envs
+this is tested with python=3.11
 
+1. copy your pi env 
+```bash
+conda create --name (new_name) --clone (original_env_name)
+```
+2. install dependencies for robosuite
+```bash
+git clone https://github.com/ARISE-Initiative/robosuite
+cd robosuite
+pip install -e .
+```
+
+3. install dependencies for robocasa
+```bash
+cd ..
+git clone https://github.com/robocasa/robocasa
+cd robocasa
+pip install -U "numpy==1.26.0" "numba==0.60.0"
+```
+change setup.py so that
+
+numpy==1.23.3 → numpy==1.26.0
+
+numba==0.56.4 → numba==0.60.0
+```bash
+pip install -e . --no-build-isolation
+pip install protobuf==3.20.3
+```
+
+download assets
+
+```bash
+python robocasa/scripts/download_kitchen_assets.py   # Caution: Assets to be downloaded are around 5GB.
+python robocasa/scripts/setup_macros.py              # Set up system variables.
+```
 
 # openpi
 

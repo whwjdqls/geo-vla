@@ -1075,7 +1075,7 @@ _CONFIGS = [
         num_train_steps=30_000,
         
         
-        freeze_filter=pi0_config.Pi0Conpi0_robocasa_pt_full_pt_v3_FMfig(
+        freeze_filter=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.

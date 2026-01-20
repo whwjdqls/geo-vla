@@ -1481,6 +1481,7 @@ _CONFIGS = [
         checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
         # aux_loss_weight=0.1,
     ),
+
     TrainConfig( # this is a point track head with bigger point expert
         name="pi05_robocasa_pt_v3_attend_action_fm",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False,
@@ -1773,6 +1774,118 @@ _CONFIGS = [
         num_train_steps=30_000,
         checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
     ),
+   
+    TrainConfig( # this is a point track head with bigger point expert pi05_ours_full_finetune_openvla_libero_pt_v3_attend_action_FM
+        name="pi05_robocasa_pt_full_pt_v3_new_head_FM",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False,
+                                   aux_expert_type="point",
+                                   point_expert_variant="point_head_v3",
+                                   allow_aux_to_attend_suffix=True,
+                                   use_flow_matching=True,
+                                   use_new_head=True,
+                                   condition_aux_on_timestep=False
+                                   ),
+        # use_local_data=True,
+        data=LeRobotRobocasaPointTrackDataConfig(
+            # repo_id="physical-intelligence/libero",
+            repo_id="whwjdqls99/robocasa_pt",
+            base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
+            extra_delta_transform=False, # robocasa actions are already delta
+        ),
+        # batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/scratch2/whwjdqls99/pi/pi05_base", # please override this
+        num_train_steps=30_000,
+        checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
+    ),
+    
+    #### pi0 #####
+    TrainConfig( # this is a point track head with bigger point expert
+        name="pi0_robocasa_pt",
+        model=pi0_config.Pi0Config(pi05=False, action_horizon=10, max_token_len=200, 
+                                   discrete_state_input=False, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+                                   ),
+        data=LeRobotRobocasaPointTrackDataConfig(
+            repo_id="whwjdqls99/robocasa_pt",
+            base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
+            extra_delta_transform=False, # robocasa actions are already delta
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/scratch2/whwjdqls99/pi/pi_zero", # please override this
+        num_train_steps=30_000,
+        checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
+    ),
+    TrainConfig( # this is a point track head with bigger point expert
+        name="pi0_robocasa_pt_full",
+        model=pi0_config.Pi0Config(pi05=False, action_horizon=10, max_token_len=200, 
+                                   discrete_state_input=False,),
+        data=LeRobotRobocasaPointTrackDataConfig(
+            repo_id="whwjdqls99/robocasa_pt",
+            base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
+            extra_delta_transform=False, # robocasa actions are already delta
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/scratch2/whwjdqls99/pi/pi_zero", # please override this
+        num_train_steps=30_000,
+        checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
+    ),
+    TrainConfig( # this is a point track head with bigger point expert
+        name="pi0_robocasa_pt_full_pt_v3_attend_action_FM",
+        model=pi0_config.Pi0Config(pi05=False, action_horizon=10, max_token_len=200, 
+                                      aux_expert_type="point",
+                                        point_expert_variant="point_head_v3",
+                                        allow_aux_to_attend_suffix=True,
+                                        use_flow_matching=True,
+                                        condition_aux_on_timestep=False,
+                                   discrete_state_input=False,),
+        data=LeRobotRobocasaPointTrackDataConfig(
+            repo_id="whwjdqls99/robocasa_pt",
+            base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
+            extra_delta_transform=False, # robocasa actions are already delta
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/scratch2/whwjdqls99/pi/pi_zero", # please override this
+        num_train_steps=30_000,
+        checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
+    ),
+    
+    
     #
     # Fine-tuning Libero configs.
     #
@@ -2127,6 +2240,9 @@ _CONFIGS = [
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
+    print("Duplicate config names found:")
+    for config in _CONFIGS:
+        print(f"- {config.name}")
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
 

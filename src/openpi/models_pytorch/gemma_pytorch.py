@@ -18,6 +18,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         aux_expert_type="none",
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
+        use_new_head: bool = False,
     ):
         if use_adarms is None:
             use_adarms = [False, False, False]

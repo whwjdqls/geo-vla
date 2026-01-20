@@ -29,6 +29,7 @@ class Pi0Config(_model.BaseModelConfig):
     allow_aux_to_attend_suffix: bool = False  # whether to allow auxiliary expert to attend to suffix tokens
     use_flow_matching: bool = False  # whether to use flow matching loss for aux expert
     condition_aux_on_timestep: bool = False  # whether to condition aux expert on action expert timestep
+    use_new_head: bool = False  # whether to use new head architecture for aux expert
     # Set the model specific defaults.
     action_dim: int = 32
     action_horizon: int = 50

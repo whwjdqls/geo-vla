@@ -135,6 +135,11 @@ class PI0Pytorch(nn.Module):
         # this is because we only condition on regression models
         assert not (self.condition_aux_on_timestep and config.use_flow_matching), "condition_aux_on_timestep and use_flow_matching cannot be both true."
         
+        self.use_new_head = config.use_new_head 
+        assert not (self.use_new_head and config.aux_expert_type == "none"), "use_new_head is only for auxiliary experts."
+        # we cannot use self.use_new_head with allow_aux_to_attend_suffix
+        assert not (self.use_new_head and config.allow_aux_to_attend_suffix), "use_new_head cannot be used with allow_aux_to_attend_suffix."
+        
         use_adarms = [False, True] if self.pi05 else [False, False]
         if config.aux_expert_type in ["point", "depth"]:
             if self.config.use_flow_matching:
@@ -150,6 +155,7 @@ class PI0Pytorch(nn.Module):
             # use_adarms=[False, True] if self.pi05 else [False, False],
             use_adarms=use_adarms,
             precision=config.dtype,
+            use_new_head=self.use_new_head,
         )
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
@@ -186,6 +192,10 @@ class PI0Pytorch(nn.Module):
             self.state_proj = nn.Linear(32, action_expert_config.width)
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+            if self.use_flow_matching and config.aux_expert_type in ["point", "depth"]:
+                # even if we use pi0 with flow matching, we use adaRMSNorm for aux expert
+                self.time_mlp_in = nn.Linear(aux_expert_config.width, aux_expert_config.width)
+                self.time_mlp_out = nn.Linear(aux_expert_config.width, aux_expert_config.width)
 
         torch.set_float32_matmul_precision("high")
         # NOTE: Do not eagerly torch.compile() here.
@@ -365,7 +375,7 @@ class PI0Pytorch(nn.Module):
         pad_masks = []
         att_masks = []
 
-        if not self.pi05:
+        if not self.pi05: # if pi0
             if self.state_proj.weight.dtype == torch.float32:
                 state = state.to(torch.float32)
 
@@ -409,6 +419,16 @@ class PI0Pytorch(nn.Module):
 
             action_time_emb = self._apply_checkpoint(mlp_func, action_time_emb)
             adarms_cond = None
+            if self.use_flow_matching:
+                time_emb = time_emb[:, 0, :]  # (BS, D)
+                
+                def time_mlp_func(time_emb):
+                    x = self.time_mlp_in(time_emb)
+                    x = F.silu(x)  # swish == silu
+                    x = self.time_mlp_out(x)
+                    return F.silu(x)
+                time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
+                adarms_cond = time_emb
         else:
             # time MLP (for adaRMS)
             def time_mlp_func(time_emb):
@@ -443,7 +463,7 @@ class PI0Pytorch(nn.Module):
         # (Bs, 10)
         return embs, pad_masks, att_masks, adarms_cond
     
-    def embed_aux(self, aux_input, aux_target, BS, device, aux_x_t=None, adarms_cond=None) :
+    def embed_aux(self, aux_input, aux_target, BS, device, aux_x_t=None, adarms_cond=None): 
         
         if aux_input is None or aux_target is None:
             embs = None
@@ -626,7 +646,8 @@ class PI0Pytorch(nn.Module):
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         aux_embs, aux_pad_masks, aux_att_masks = self.embed_aux(aux_input, aux_target, state.shape[0], state.device, \
             aux_x_t=aux_x_t, \
-            adarms_cond=adarms_cond if self.condition_aux_on_timestep else None)
+            adarms_cond=adarms_cond if self.condition_aux_on_timestep else None
+        )
         
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype

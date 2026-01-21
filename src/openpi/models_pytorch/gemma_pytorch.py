@@ -8,6 +8,8 @@ from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
+from openpi.models_pytorch.new_head import NewAuxHead
+
 
 class PaliGemmaWithExpertModel(nn.Module):
     def __init__(
@@ -78,6 +80,27 @@ class PaliGemmaWithExpertModel(nn.Module):
         else:
             self.aux_expert = None
         self.aux_expert_type = aux_expert_type
+        self.use_new_head = use_new_head
+
+        if self.use_new_head:
+            if aux_expert_config is None:
+                raise ValueError("use_new_head=True requires aux_expert_config to be provided")
+            print(
+                "Using new head for aux expert. This head cross attends prefix outputs to generate aux outputs."
+            )
+            # Replace the aux expert LM with a lightweight head.
+            # NOTE: `aux_expert_config.width` must match the aux token embedding width.
+            self.aux_expert = NewAuxHead(
+                aux_dim=aux_expert_config.width,
+                prefix_dim=vlm_config.width,
+                depth=aux_expert_config.depth,
+                num_heads=aux_expert_config.num_heads,
+                mlp_dim=aux_expert_config.mlp_dim,
+                # depth=getattr(aux_expert_config, "depth", 2),
+                # num_heads=getattr(aux_expert_config, "num_heads", 8),
+                # mlp_dim=getattr(aux_expert_config, "mlp_dim", aux_expert_config.width * 4),
+                dropout=0.0,
+            )
         ###############################################
         
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
@@ -315,7 +338,8 @@ class PaliGemmaWithExpertModel(nn.Module):
             aux_output = None # added for aux
             
         ## ADDED for aux expert
-        elif inputs_embeds[0] is not None and inputs_embeds[1] is not None and inputs_embeds[2] is not None:
+        elif inputs_embeds[0] is not None and inputs_embeds[1] is not None and inputs_embeds[2] is not None \
+            and self.use_new_head == False:
             # when aux expert is used
             assert self.aux_expert is not None, "Aux expert model is not initialized."
             assert adarms_cond is not None and len(adarms_cond) == 3, "adarms_cond must be provided for all three models."
@@ -539,6 +563,204 @@ class PaliGemmaWithExpertModel(nn.Module):
             suffix_output = outputs_embeds[1]
             aux_output = outputs_embeds[2]
             prefix_past_key_values = None
+            
+            
+        elif inputs_embeds[0] is not None and inputs_embeds[1] is not None and inputs_embeds[2] is not None \
+            and self.use_new_head == True:
+            # This is when using a new head for aux expert.
+            assert self.aux_expert is not None, "Aux expert (new head) is not initialized."
+            aux_embs = inputs_embeds[2]
+
+            prefix_len = inputs_embeds[0].shape[1]
+            suffix_len = inputs_embeds[1].shape[1]
+            total_len_2 = prefix_len + suffix_len
+
+            def _slice_attn_mask(mask: torch.Tensor | None, total_len: int) -> torch.Tensor | None:
+                if mask is None:
+                    return None
+                if mask.ndim == 4:
+                    return mask[:, :, :total_len, :total_len]
+                if mask.ndim == 2:
+                    return mask[:, :total_len]
+                return mask
+
+            def _slice_pos_ids(pos: torch.LongTensor | None, total_len: int) -> torch.LongTensor | None:
+                if pos is None:
+                    return None
+                return pos[:, :total_len]
+
+            attn_mask_2 = _slice_attn_mask(attention_mask, total_len_2)
+            pos_ids_2 = _slice_pos_ids(position_ids, total_len_2)
+
+            # run backbone on prefix + suffix only
+            inputs_embeds = [inputs_embeds[0], inputs_embeds[1]]
+            
+            models = [self.paligemma.language_model, self.gemma_expert.model]
+            num_layers = self.paligemma.config.text_config.num_hidden_layers
+
+            # Check if gradient checkpointing is enabled for any of the models
+            use_gradient_checkpointing = (
+                hasattr(self.gemma_expert.model, "gradient_checkpointing")
+                and self.gemma_expert.model.gradient_checkpointing
+                and self.training
+            ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
+
+            # Force enable gradient checkpointing if we're in training mode and the model supports it
+            if self.training and hasattr(self.gemma_expert.model, "gradient_checkpointing"):
+                if not self.gemma_expert.model.gradient_checkpointing:
+                    print("Forcing gradient checkpointing to be enabled for Gemma expert model")
+                    self.gemma_expert.model.gradient_checkpointing = True
+                use_gradient_checkpointing = True
+
+            # Debug gradient checkpointing status
+            if hasattr(self, "_debug_gc_printed") and not self._debug_gc_printed:
+                print(f"Gemma expert model gradient checkpointing: {use_gradient_checkpointing}")
+                print(f"Model training mode: {self.training}")
+                print(
+                    f"Gemma expert model has gradient_checkpointing attr: {hasattr(self.gemma_expert.model, 'gradient_checkpointing')}"
+                )
+                if hasattr(self.gemma_expert.model, "gradient_checkpointing"):
+                    print(
+                        f"Gemma expert model gradient_checkpointing value: {self.gemma_expert.model.gradient_checkpointing}"
+                    )
+                self._debug_gc_printed = True
+
+            # Define the complete layer computation function for gradient checkpointing
+            def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond):
+                models = [self.paligemma.language_model, self.gemma_expert.model]
+
+                query_states = []
+                key_states = []
+                value_states = []
+                gates = []
+                for i, hidden_states in enumerate(inputs_embeds):
+                    layer = models[i].layers[layer_idx]
+                    hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
+                    gates.append(gate)
+
+                    input_shape = hidden_states.shape[:-1]
+                    hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+                    query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                    key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                    value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+                    query_states.append(query_state)
+                    key_states.append(key_state)
+                    value_states.append(value_state)
+
+                # Concatenate and process attention
+                query_states = torch.cat(query_states, dim=2)
+                key_states = torch.cat(key_states, dim=2)
+                value_states = torch.cat(value_states, dim=2)
+
+                dummy_tensor = torch.zeros(
+                    query_states.shape[0],
+                    query_states.shape[2],
+                    query_states.shape[-1],
+                    device=query_states.device,
+                    dtype=query_states.dtype,
+                )
+                cos, sin = self.paligemma.model.language_model.rotary_emb(dummy_tensor, position_ids)
+                query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin, unsqueeze_dim=1
+                )
+
+                batch_size = query_states.shape[0]
+                scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
+
+                # Attention computation
+                att_output, _ = modeling_gemma.eager_attention_forward(
+                    self.paligemma.language_model.layers[layer_idx].self_attn,
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    scaling,
+                )
+                # Get head_dim from the current layer, not from the model
+                head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
+                att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
+
+                # Process layer outputs
+                outputs_embeds = []
+                start_pos = 0
+                for i, hidden_states in enumerate(inputs_embeds):
+                    layer = models[i].layers[layer_idx]
+                    end_pos = start_pos + hidden_states.shape[1]
+
+                    if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+                        att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+                    out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
+
+                    # first residual
+                    out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
+                    after_first_residual = out_emb.clone()
+                    out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
+                    # Convert to bfloat16 if the next layer (mlp) uses bfloat16
+                    if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+                        out_emb = out_emb.to(dtype=torch.bfloat16)
+
+                    out_emb = layer.mlp(out_emb)
+                    # second residual
+                    out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
+                    outputs_embeds.append(out_emb)
+                    start_pos = end_pos
+
+                return outputs_embeds
+
+            # Process all layers with gradient checkpointing if enabled
+            for layer_idx in range(num_layers):
+                if use_gradient_checkpointing:
+                    inputs_embeds = torch.utils.checkpoint.checkpoint(
+                        compute_layer_complete,
+                        layer_idx,
+                        inputs_embeds,
+                        attn_mask_2,
+                        pos_ids_2,
+                        adarms_cond,
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                    )
+                else:
+                    inputs_embeds = compute_layer_complete(
+                        layer_idx, inputs_embeds, attn_mask_2, pos_ids_2, adarms_cond
+                    )
+
+                # Old code removed - now using compute_layer_complete function above
+
+            # final norm
+            # Define final norm computation function for gradient checkpointing
+            def compute_final_norms(inputs_embeds, adarms_cond):
+                outputs_embeds = []
+                for i, hidden_states in enumerate(inputs_embeds):
+                    out_emb, _ = models[i].norm(hidden_states, cond=adarms_cond[i])
+                    outputs_embeds.append(out_emb)
+                return outputs_embeds
+
+            # Apply gradient checkpointing to final norm if enabled
+            if use_gradient_checkpointing:
+                outputs_embeds = torch.utils.checkpoint.checkpoint(
+                    compute_final_norms, inputs_embeds, adarms_cond, use_reentrant=False, preserve_rng_state=False
+                )
+            else:
+                outputs_embeds = compute_final_norms(inputs_embeds, adarms_cond)
+
+            prefix_output = outputs_embeds[0]
+            suffix_output = outputs_embeds[1]
+            prefix_past_key_values = None
+            # Use prefix outputs as cross-attention K/V to generate aux outputs.
+            prefix_key_padding_mask = None
+            if attn_mask_2 is not None and attn_mask_2.ndim == 4:
+                # PI0 provides float mask with 0 for allowed, large negative for masked.
+                # Use query=0 row as a proxy for which prefix keys are valid.
+                prefix_key_valid = attn_mask_2[:, 0, 0, :prefix_len] == 0
+                prefix_key_padding_mask = ~prefix_key_valid
+
+            aux_output = self.aux_expert(
+                prefix_tokens=prefix_output,
+                aux_tokens=aux_embs,
+                prefix_key_padding_mask=prefix_key_padding_mask,
+            )
         else:
             raise ValueError("Invalid inputs_embeds configuration.")
 

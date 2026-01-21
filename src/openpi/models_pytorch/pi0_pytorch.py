@@ -235,7 +235,15 @@ class PI0Pytorch(nn.Module):
         self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
         if self.paligemma_with_expert.aux_expert is not None:
-            self.paligemma_with_expert.aux_expert.model.gradient_checkpointing = True
+            aux = self.paligemma_with_expert.aux_expert
+            # Old aux expert is a HF GemmaForCausalLM with `.model.gradient_checkpointing`.
+            if hasattr(aux, "model") and hasattr(aux.model, "gradient_checkpointing"):
+                aux.model.gradient_checkpointing = True
+            # New aux head is a plain nn.Module.
+            elif hasattr(aux, "gradient_checkpointing"):
+                aux.gradient_checkpointing = True
+            elif hasattr(aux, "gradient_checkpointing_enable"):
+                aux.gradient_checkpointing_enable()
 
         logging.info("Enabled gradient checkpointing for PI0Pytorch model")
 
@@ -246,7 +254,13 @@ class PI0Pytorch(nn.Module):
         self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
         if self.paligemma_with_expert.aux_expert is not None:
-            self.paligemma_with_expert.aux_expert.model.gradient_checkpointing = False
+            aux = self.paligemma_with_expert.aux_expert
+            if hasattr(aux, "model") and hasattr(aux.model, "gradient_checkpointing"):
+                aux.model.gradient_checkpointing = False
+            elif hasattr(aux, "gradient_checkpointing"):
+                aux.gradient_checkpointing = False
+            elif hasattr(aux, "gradient_checkpointing_disable"):
+                aux.gradient_checkpointing_disable()
 
         logging.info("Disabled gradient checkpointing for PI0Pytorch model")
 
@@ -463,7 +477,7 @@ class PI0Pytorch(nn.Module):
         # (Bs, 10)
         return embs, pad_masks, att_masks, adarms_cond
     
-    def embed_aux(self, aux_input, aux_target, BS, device, aux_x_t=None, adarms_cond=None): 
+    def embed_aux(self, aux_input, aux_target, BS, device, aux_x_t=None, adarms_cond=None, t_aux=None): 
         
         if aux_input is None or aux_target is None:
             embs = None
@@ -487,11 +501,24 @@ class PI0Pytorch(nn.Module):
 
             aux_input_proj = self._apply_checkpoint(aux_in_proj_func, aux_input) # (BS, 1, width)
             embs.append(aux_input_proj)
+
+            # New head: add a simple aux-time token (independent of action timestep).
+            if self.use_new_head:
+                if t_aux is None:
+                    raise ValueError("t_aux must be provided when use_new_head=True")
+                aux_time_emb = create_sinusoidal_pos_embedding(
+                    t_aux,
+                    aux_input_proj.shape[-1],
+                    min_period=4e-3,
+                    max_period=4.0,
+                    device=t_aux.device,
+                ).to(dtype=aux_input_proj.dtype)
+                embs.append(aux_time_emb[:, None, :])
             
             # use learnable query tokens for point cloud regression
             if self.aux_query_tokens is not None:
                 
-                if self.condition_aux_on_timestep: # condition aux expert on action expert timestep
+                if self.condition_aux_on_timestep and (not self.use_new_head): # condition aux expert on action expert timestep
                     assert adarms_cond is not None, "adarms_cond must be provided when conditioning aux on timestep."
                     # project adarms_cond to use it for aux expert
                     def adarms_cond_to_aux(adarms_cond):
@@ -528,9 +555,22 @@ class PI0Pytorch(nn.Module):
             aux_input_proj = self._apply_checkpoint(aux_in_proj_func, aux_input)  # (BS, 1, width)
             embs.append(aux_input_proj)
 
+            # New head: add a simple aux-time token (independent of action timestep).
+            if self.use_new_head:
+                if t_aux is None:
+                    raise ValueError("t_aux must be provided when use_new_head=True")
+                aux_time_emb = create_sinusoidal_pos_embedding(
+                    t_aux,
+                    aux_input_proj.shape[-1],
+                    min_period=4e-3,
+                    max_period=4.0,
+                    device=t_aux.device,
+                ).to(dtype=aux_input_proj.dtype)
+                embs.append(aux_time_emb[:, None, :])
+
             if self.aux_query_tokens is not None:
                 
-                if self.condition_aux_on_timestep: # condition aux expert on action expert timestep
+                if self.condition_aux_on_timestep and (not self.use_new_head): # condition aux expert on action expert timestep
                     assert adarms_cond is not None, "adarms_cond must be provided when conditioning aux on timestep."
                     # project adarms_cond to use it for aux expert
                     def adarms_cond_to_aux(adarms_cond):
@@ -634,8 +674,17 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
+        # Aux head time for the new head (kept independent from action diffusion time).
+        t_aux = None
+        if self.use_new_head and aux_target is not None:
+            if self.config.use_flow_matching:
+                t_aux = self.sample_time(actions.shape[0], actions.device)
+            else:
+                t_aux = torch.zeros(actions.shape[0], dtype=torch.float32, device=actions.device)
+
         if self.config.use_flow_matching:
-            aux_x_t = time_expanded * aux_noise + (1 - time_expanded) * aux_target if aux_target is not None else None
+            aux_time_expanded = time_expanded if (not self.use_new_head) else (t_aux[:, None, None] if t_aux is not None else time_expanded)
+            aux_x_t = aux_time_expanded * aux_noise + (1 - aux_time_expanded) * aux_target if aux_target is not None else None
             aux_u_t = aux_noise - aux_target if aux_target is not None else None
             aux_target = aux_u_t  # for flow matching, the target is the velocity field
         else:
@@ -644,9 +693,15 @@ class PI0Pytorch(nn.Module):
         
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
-        aux_embs, aux_pad_masks, aux_att_masks = self.embed_aux(aux_input, aux_target, state.shape[0], state.device, \
-            aux_x_t=aux_x_t, \
-            adarms_cond=adarms_cond if self.condition_aux_on_timestep else None
+        adarms_cond_for_aux = None if self.use_new_head else (adarms_cond if self.condition_aux_on_timestep else None)
+        aux_embs, aux_pad_masks, aux_att_masks = self.embed_aux(
+            aux_input,
+            aux_target,
+            state.shape[0],
+            state.device,
+            aux_x_t=aux_x_t,
+            adarms_cond=adarms_cond_for_aux,
+            t_aux=t_aux,
         )
         
         if (
@@ -920,7 +975,8 @@ class PI0Pytorch(nn.Module):
                 bsize,
                 device,
                 aux_x_t=None,
-                adarms_cond=adarms_cond if self.condition_aux_on_timestep else None,
+                adarms_cond=None if self.use_new_head else (adarms_cond if self.condition_aux_on_timestep else None),
+                t_aux=torch.zeros(bsize, dtype=torch.float32, device=device) if self.use_new_head else None,
             )
 
             # Cast to bfloat16 if the backbone runs in bf16.
@@ -997,7 +1053,8 @@ class PI0Pytorch(nn.Module):
                     bsize,
                     device,
                     aux_x_t=aux_x_t,
-                    adarms_cond=adarms_cond if self.condition_aux_on_timestep else None,
+                    adarms_cond=None if self.use_new_head else (adarms_cond if self.condition_aux_on_timestep else None),
+                    t_aux=time if self.use_new_head else None,
                 )
 
                 if (

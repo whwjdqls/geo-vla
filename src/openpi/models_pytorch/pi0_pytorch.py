@@ -772,7 +772,10 @@ class PI0Pytorch(nn.Module):
             aux_pred = self._apply_checkpoint(aux_out_proj_func, aux_suffix_out)  # (BS, T, aux_dim)
             
             # aux_loss = F.mse_loss(aux_pred, aux_target, reduction="none").mean(dim=-1)  # (BS, T)   
-            aux_loss = F.mse_loss(aux_pred, aux_target, reduction="mean")  # scalar
+            if self.config.use_huber_loss:
+                aux_loss = F.smooth_l1_loss(aux_pred, aux_target, reduction="mean")  # scalar
+            else:
+                aux_loss = F.mse_loss(aux_pred, aux_target, reduction="mean")  # scalar
             # aux_loss = aux_loss * self.config.aux_loss_weight
         else:
             aux_loss = torch.tensor(0.0, device=state.device) # for compatibility

@@ -150,6 +150,7 @@ def save_aux_videos_and_log_wandb(
     num_to_save = min(3, pred_np.shape[0])
     for i in range(num_to_save):
         pred_path = out_dir / f"pred_{i}.mp4"
+        print(f"Saving pred video to {pred_path}")
         render_point_positions_video(pred_np[i], pred_path, fps=fps, point_size=point_size, axis_mode=axis_mode)
         if wandb_enabled:
             # When providing a file path, wandb uses the video's embedded fps.
@@ -363,16 +364,18 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config,
         logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
 
         # Optionally save auxiliary point-track videos and log first 3 to wandb.
+        print(f"save_aux: {getattr(config, 'save_aux', False)}")
         if getattr(config, "save_aux", False):
-            try:
-                save_aux_videos_and_log_wandb(
-                    aux_output,
-                    out_dir=final_ckpt_dir / "aux_videos",
-                    global_step=global_step,
-                    wandb_enabled=bool(config.wandb_enabled),
-                )
-            except Exception:
-                logging.exception("Failed to save/log aux videos at step %s", global_step)
+            # try:
+            print(f"Saving aux videos to {final_ckpt_dir / 'aux_videos'}")
+            save_aux_videos_and_log_wandb(
+                aux_output,
+                out_dir=final_ckpt_dir / "aux_videos",
+                global_step=global_step,
+                wandb_enabled=bool(config.wandb_enabled),
+            )
+            # except Exception:
+            #     logging.exception("Failed to save/log aux videos at step %s", global_step)
 
         # Log checkpoint to wandb
         if config.wandb_enabled:

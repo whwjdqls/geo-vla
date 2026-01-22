@@ -162,9 +162,28 @@ class PI0Pytorch(nn.Module):
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)
 
         self.use_flow_matching = config.use_flow_matching # this is for the aux head
+        self.use_point_fusion_mlp = getattr(config, 'use_point_fusion_mlp', False)  # OpenVLA-OFT style fusion
+
         if config.aux_expert_type in ["point", "depth"]:
             self.aux_in_proj = nn.Linear(self.aux_dim, aux_expert_config.width)
             self.aux_out_proj = nn.Linear(aux_expert_config.width, self.aux_dim)
+
+            # Per-point feature MLP for output fusion (OpenVLA-OFT style)
+            # Only created when use_point_fusion_mlp=True
+            if self.use_point_fusion_mlp and config.aux_expert_type == "point":
+                self.point_hidden_dim = 256
+                self.point_mlp = nn.Sequential(
+                    nn.Linear(3, self.point_hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(self.point_hidden_dim, self.point_hidden_dim),
+                )
+                # Fusion MLP: combines aux context (from transformer) with per-point features
+                self.fusion_mlp = nn.Sequential(
+                    nn.Linear(aux_expert_config.width + self.point_hidden_dim, aux_expert_config.width),
+                    nn.GELU(),
+                    nn.Linear(aux_expert_config.width, 3),  # output per-point delta
+                )
+
             if not config.use_flow_matching:
                 # for regression tasks, we use learnable query tokens
                 self.aux_query_tokens = nn.Parameter(torch.zeros(1, self.config.action_horizon, aux_expert_config.width))
@@ -763,20 +782,55 @@ class PI0Pytorch(nn.Module):
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
-        if aux_out is not None:
-            # compute auxiliary loss
+        if aux_out is not None and self.config.aux_expert_type == "point" and self.use_point_fusion_mlp:
+            # compute auxiliary loss with per-point fusion (OpenVLA-OFT style)
+            aux_suffix_out = aux_out[:, -aux_target.shape[1]:, :]  # (BS, T, width)
+            aux_suffix_out = aux_suffix_out.to(dtype=torch.float32)
+
+            B, T, aux_dim = aux_target.shape
+            N = aux_dim // 3  # number of points
+
+            # Recover per-point coordinates from aux_input: (B, 1, N*3) → (B, N, 3)
+            point_cloud_t0 = aux_input.reshape(B, N, 3)  # normalized point cloud at t=0
+
+            # Per-point feature encoding (preserves point identity)
+            def point_mlp_func(point_cloud):
+                return self.point_mlp(point_cloud)
+            point_feat = self._apply_checkpoint(point_mlp_func, point_cloud_t0)  # (B, N, point_hidden)
+
+            # Fusion: combine aux context (global) with per-point features (local)
+            # aux_suffix_out: (B, T, width) - contains VLM + action context from attention
+            # point_feat: (B, N, point_hidden) - per-point identity
+            width = aux_suffix_out.shape[-1]
+
+            # Expand for cross-product fusion
+            ctx_expanded = aux_suffix_out.unsqueeze(2).expand(-1, -1, N, -1)  # (B, T, N, width)
+            pt_expanded = point_feat.unsqueeze(1).expand(-1, T, -1, -1)  # (B, T, N, point_hidden)
+
+            # Concatenate and predict per-point delta
+            fusion_input = torch.cat([ctx_expanded, pt_expanded], dim=-1)  # (B, T, N, width + point_hidden)
+
+            def fusion_mlp_func(fusion_input):
+                return self.fusion_mlp(fusion_input)
+            pred_reshaped = self._apply_checkpoint(fusion_mlp_func, fusion_input)  # (B, T, N, 3)
+
+            # For compatibility, also compute flattened version
+            aux_pred = pred_reshaped.reshape(B, T, N * 3)  # (B, T, aux_dim)
+
+            # Simple Huber loss (smooth L1)
+            target_reshaped = aux_target.reshape(B, T, N, 3)
+            aux_loss = F.smooth_l1_loss(pred_reshaped, target_reshaped, reduction="mean")
+
+        elif aux_out is not None:
+            # Fallback for depth or other aux types: use original linear projection
             aux_suffix_out = aux_out[:, -aux_target.shape[1]:, :]  # (BS, T, D)
             aux_suffix_out = aux_suffix_out.to(dtype=torch.float32)
             def aux_out_proj_func(aux_suffix_out):
                 return self.aux_out_proj(aux_suffix_out)
             aux_pred = self._apply_checkpoint(aux_out_proj_func, aux_suffix_out)  # (BS, T, aux_dim)
-            
-            # aux_loss = F.mse_loss(aux_pred, aux_target, reduction="none").mean(dim=-1)  # (BS, T)   
-            if self.config.use_huber_loss:
-                aux_loss = F.smooth_l1_loss(aux_pred, aux_target, reduction="mean")  # scalar
-            else:
-                aux_loss = F.mse_loss(aux_pred, aux_target, reduction="mean")  # scalar
-            # aux_loss = aux_loss * self.config.aux_loss_weight
+
+            # Simple Huber loss (smooth L1)
+            aux_loss = F.smooth_l1_loss(aux_pred, aux_target, reduction="mean")
         else:
             aux_loss = torch.tensor(0.0, device=state.device) # for compatibility
             
@@ -1079,7 +1133,23 @@ class PI0Pytorch(nn.Module):
             )
             aux_out = outputs_embeds[2]
             aux_suffix_out = aux_out[:, -self.config.action_horizon :, :].to(dtype=torch.float32)
-            aux_pred_norm = self.aux_out_proj(aux_suffix_out)  # (B, T, aux_dim)
+
+            if self.use_point_fusion_mlp:
+                # Per-point fusion for inference (same as training)
+                N = self.aux_dim // 3
+                point_cloud_t0 = aux_input.reshape(bsize, N, 3)  # (B, N, 3) normalized
+                point_feat = self.point_mlp(point_cloud_t0)  # (B, N, point_hidden)
+
+                T = aux_suffix_out.shape[1]
+                ctx_expanded = aux_suffix_out.unsqueeze(2).expand(-1, -1, N, -1)  # (B, T, N, width)
+                pt_expanded = point_feat.unsqueeze(1).expand(-1, T, -1, -1)  # (B, T, N, point_hidden)
+
+                fusion_input = torch.cat([ctx_expanded, pt_expanded], dim=-1)  # (B, T, N, width + point_hidden)
+                pred_reshaped = self.fusion_mlp(fusion_input)  # (B, T, N, 3)
+                aux_pred_norm = pred_reshaped.reshape(bsize, T, N * 3)  # (B, T, aux_dim)
+            else:
+                # Original linear projection
+                aux_pred_norm = self.aux_out_proj(aux_suffix_out)  # (B, T, aux_dim)
 
         else:
             # Flow matching aux head: Euler-integrate aux deltas while holding actions fixed.

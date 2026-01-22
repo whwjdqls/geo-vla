@@ -28,6 +28,7 @@ import gc
 import logging
 import os
 import platform
+import pathlib
 import shutil
 import time
 
@@ -52,6 +53,117 @@ import openpi.training.config as _config
 import openpi.training.data_loader as _data
 
 import openpi.depth_encoders.load_encoders as _depth_encoders 
+
+
+def render_point_positions_video(
+    positions: np.ndarray,
+    out_path: pathlib.Path,
+    *,
+    fps: int = 10,
+    point_size: float = 2.0,
+    axis_mode: str = "global",
+) -> None:
+    """Render a point cloud sequence video.
+
+    Args:
+      positions: (T, N, 3) or (T+1, N, 3) absolute positions over time.
+      axis_mode:
+        - "global": fixed limits from all frames (default)
+        - "p0": fixed limits from first frame only
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import imageio.v2 as imageio
+
+    if positions.ndim != 3 or positions.shape[-1] != 3:
+        raise ValueError(f"positions must be (T, N, 3), got {positions.shape}")
+    if axis_mode not in {"global", "p0"}:
+        raise ValueError(f"axis_mode must be 'global' or 'p0', got {axis_mode!r}")
+
+    ref = positions[0:1] if axis_mode == "p0" else positions
+    mins = ref.reshape(-1, 3).min(axis=0)
+    maxs = ref.reshape(-1, 3).max(axis=0)
+    center = 0.5 * (mins + maxs)
+    radius = float(np.max(maxs - mins) * 0.55 + 1e-6)
+
+    fig = plt.figure(figsize=(6, 6), dpi=160)
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_xlim(center[0] - radius, center[0] + radius)
+    ax.set_ylim(center[1] - radius, center[1] + radius)
+    ax.set_zlim(center[2] - radius, center[2] + radius)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_zlabel("z")
+    ax.view_init(elev=20, azim=-60)
+
+    scat = ax.scatter(
+        positions[0, :, 0],
+        positions[0, :, 1],
+        positions[0, :, 2],
+        s=point_size,
+        c="tab:blue",
+        depthshade=False,
+    )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with imageio.get_writer(str(out_path), fps=fps) as writer:
+        for t in range(positions.shape[0]):
+            pts = positions[t]
+            scat._offsets3d = (pts[:, 0], pts[:, 1], pts[:, 2])
+            ax.set_title(f"t={t:02d}")
+            fig.canvas.draw()
+            rgba = np.asarray(fig.canvas.buffer_rgba())
+            frame = rgba[:, :, :3].copy()
+            writer.append_data(frame)
+
+    plt.close(fig)
+
+
+def save_aux_videos_and_log_wandb(
+    aux_output,
+    *,
+    out_dir: pathlib.Path,
+    global_step: int,
+    wandb_enabled: bool,
+    fps: int = 10,
+    point_size: float = 2.0,
+    axis_mode: str = "global",
+) -> None:
+    if aux_output is None:
+        return
+
+    pred = aux_output.get("pred_point_tracks") if isinstance(aux_output, dict) else None
+    gt = aux_output.get("gt_point_tracks") if isinstance(aux_output, dict) else None
+    if pred is None:
+        return
+
+    pred_np = pred.detach().to(device="cpu", dtype=torch.float32).numpy()
+    gt_np = None
+    if gt is not None:
+        gt_np = gt.detach().to(device="cpu", dtype=torch.float32).numpy()
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    videos_to_log = {}
+
+    num_to_save = min(3, pred_np.shape[0])
+    for i in range(num_to_save):
+        pred_path = out_dir / f"pred_{i}.mp4"
+        render_point_positions_video(pred_np[i], pred_path, fps=fps, point_size=point_size, axis_mode=axis_mode)
+        if wandb_enabled:
+            # When providing a file path, wandb uses the video's embedded fps.
+            # Passing `fps=` triggers a warning and has no effect.
+            videos_to_log[f"aux/pred_{i}"] = wandb.Video(str(pred_path), format="mp4")
+
+        if gt_np is not None:
+            gt_path = out_dir / f"gt_{i}.mp4"
+            render_point_positions_video(gt_np[i], gt_path, fps=fps, point_size=point_size, axis_mode=axis_mode)
+            if wandb_enabled:
+                videos_to_log[f"aux/gt_{i}"] = wandb.Video(str(gt_path), format="mp4")
+
+    if wandb_enabled and len(videos_to_log) > 0:
+        wandb.log(videos_to_log, step=global_step)
 
 def tree_map(fn, *trees):
     """A simple recursive tree_map for nested dictionaries and lists. Supports multiple trees."""
@@ -207,7 +319,7 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, *, aux_output=None):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
         return
@@ -249,6 +361,18 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         tmp_ckpt_dir.rename(final_ckpt_dir)
 
         logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
+
+        # Optionally save auxiliary point-track videos and log first 3 to wandb.
+        if getattr(config, "save_aux", False):
+            try:
+                save_aux_videos_and_log_wandb(
+                    aux_output,
+                    out_dir=final_ckpt_dir / "aux_videos",
+                    global_step=global_step,
+                    wandb_enabled=bool(config.wandb_enabled),
+                )
+            except Exception:
+                logging.exception("Failed to save/log aux videos at step %s", global_step)
 
         # Log checkpoint to wandb
         if config.wandb_enabled:
@@ -626,7 +750,11 @@ def train_loop(config: _config.TrainConfig):
                 pg["lr"] = lr_schedule(global_step)
 
             # Forward pass
-            fm_loss, aux_loss = model(observation, actions)
+            aux_output = None
+            if config.save_aux:
+                fm_loss, aux_loss, aux_output = model(observation, actions, return_aux=True)
+            else:
+                fm_loss, aux_loss = model(observation, actions)
             # Ensure losses is a tensor and handle different return types
             
             losses = (fm_loss, aux_loss)
@@ -715,7 +843,21 @@ def train_loop(config: _config.TrainConfig):
                     # Log to wandb
                     if config.wandb_enabled:
                         wandb.log(log_payload, step=global_step)
-                    
+                    # Optionally save auxiliary point-track videos and log first 3 to wandb.
+                        if getattr(config, "save_aux", False):
+                            try:
+                                tmp_vis_dir = config.checkpoint_dir / "vis_tmp"
+                                tmp_vis_dir.mkdir(parents=True, exist_ok=True)
+                                
+                                save_aux_videos_and_log_wandb(
+                                    aux_output,
+                                    out_dir=tmp_vis_dir / "aux_videos",
+                                    global_step=global_step,
+                                    wandb_enabled=bool(config.wandb_enabled),
+                                )
+                            except Exception:
+                                logging.exception("Failed to save/log aux videos at step %s", global_step)
+
                     # Log to tensorboard
                     if tb_writer is not None:
                         tb_writer.add_scalar("train/loss", avg_loss, global_step)
@@ -732,7 +874,7 @@ def train_loop(config: _config.TrainConfig):
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            save_checkpoint(model, optim, global_step, config, is_main, data_config, aux_output=aux_output if config.save_aux else None)
 
             # Update progress bar
             if pbar is not None:

@@ -794,7 +794,62 @@ class PI0Pytorch(nn.Module):
         #     aux_v_t = self._apply_checkpoint(self.aux_action_out_proj, suffix_out)
         #     aux_loss = F.mse_loss(u_t, aux_v_t, reduction="none")
         #     loss = loss + (self.aux_loss_weight * aux_loss)
+        aux_output = None
+        if return_aux:
+            # Return reconstructed point tracks for visualization/debug.
+            # This is only supported for point-cloud auxiliary expert.
+            if self.config.aux_expert_type != "point":
+                aux_output = None
+            elif aux_input is None or aux_pred is None:
+                aux_output = None
+            elif self.stats is None:
+                aux_output = None
+            else:
+                # aux_input is normalized p0 flattened: (B, 1, aux_dim)
+                # aux_pred is either normalized deltas (regression) or velocity field (flow matching): (B, T, aux_dim)
+                bsize = aux_input.shape[0]
+                expected_n = self.aux_dim // 3
 
+                mean = torch.tensor(self.stats["point_cloud"]["mean"], device=aux_input.device).squeeze().to(aux_input.dtype)
+                std = torch.tensor(self.stats["point_cloud"]["std"], device=aux_input.device).squeeze().to(aux_input.dtype)
+                delta_mean = torch.tensor(self.stats["point_cloud"]["delta_mean"], device=aux_input.device).squeeze().to(aux_input.dtype)
+                delta_std = torch.tensor(self.stats["point_cloud"]["delta_std"], device=aux_input.device).squeeze().to(aux_input.dtype)
+
+                p0_norm = aux_input.reshape(bsize, expected_n, 3)
+                p0_raw = p0_norm * std + mean  # (B, N, 3)
+
+                if self.config.use_flow_matching:
+                    if aux_noise is None:
+                        raise ValueError("aux_noise must be provided to reconstruct deltas for flow matching.")
+                    # In flow matching, target is u = noise - delta_norm.
+                    # If aux_pred approximates u, then delta_norm_hat = noise - aux_pred.
+                    delta_pred_norm = (aux_noise - aux_pred).reshape(bsize, self.config.action_horizon, expected_n, 3)
+                else:
+                    delta_pred_norm = aux_pred.reshape(bsize, self.config.action_horizon, expected_n, 3)
+
+                delta_pred_raw = delta_pred_norm * delta_std + delta_mean  # (B, T, N, 3)
+                pred_tracks_raw = torch.cat(
+                    [p0_raw[:, None, :, :], p0_raw[:, None, :, :] + torch.cumsum(delta_pred_raw, dim=1)],
+                    dim=1,
+                )  # (B, T+1, N, 3)
+
+                # Ground-truth tracks, subsampled to match aux_dim.
+                gt_tracks_raw = None
+                if hasattr(observation, "point_cloud") and observation.point_cloud is not None:
+                    pc = observation.point_cloud
+                    if pc.ndim == 4 and pc.shape[-1] == 3:
+                        p0_full = pc[:, 0, :, :]
+                        original_n = p0_full.shape[1]
+                        sample_stride = original_n // expected_n
+                        gt_tracks_raw = pc[:, : self.config.action_horizon + 1, ::sample_stride, :]
+
+                aux_output = {
+                    "pred_point_tracks": pred_tracks_raw,
+                    "gt_point_tracks": gt_tracks_raw,
+                }
+
+        if return_aux:
+            return loss, aux_loss, aux_output
         return loss, aux_loss
 
     @torch.no_grad()
@@ -896,12 +951,14 @@ class PI0Pytorch(nn.Module):
         num_aux_steps: int = 10,
         norm_bug: bool = False,
     ):
-        """Predict actions and point tracks (as per-step point deltas) for visualization.
+        """Predict actions and point tracks for visualization.
+
+        The aux head predicts per-step *deltas* (in either normalized space or raw space depending
+        on `norm_bug`), but this method returns reconstructed *positions* with p0 prepended.
 
         Returns:
           actions_pred: (B, action_horizon, action_dim)
-          p0: (B, N, 3) raw point cloud at t=0 (sampled to match aux_dim)
-          delta_pred: (B, action_horizon, N, 3) predicted per-step deltas in raw units
+          point_tracks: (B, action_horizon + 1, N, 3) absolute positions in raw units.
         """
         if self.config.aux_expert_type != "point":
             raise ValueError(
@@ -1113,7 +1170,8 @@ class PI0Pytorch(nn.Module):
             point_tracks = p0[:, None, :, :] + torch.cumsum(delta_pred, dim=1)  # (B, T, N, 3)
         else: # this is when there was a norm bug, where we first get the pts and then denorm
             point_tracks_norm = p0_norm[:, None, :, :] + torch.cumsum(delta_pred_norm, dim=1)  # (B, T, N, 3)
-            point_tracks = point_tracks_norm * std[None, None, :, :] + mean[None, None, :, :]
+            # point_tracks = point_tracks_norm * std[None, None, :, :] + mean[None, None, :, :]
+            point_tracks = point_tracks_norm *std + mean
 
         # concat along time dimension
         point_tracks = torch.cat([p0[:, None, :, :], point_tracks], dim=1)  # (B, T+1, N, 3)

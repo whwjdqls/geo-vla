@@ -774,6 +774,10 @@ class TrainConfig:
 
     # this is the weight for our auxiliary loss
     aux_loss_weight: float = 0.0
+
+    # If true, save auxiliary point-track visualization videos (pred + GT) at checkpoint save time,
+    # and upload the first 3 samples to wandb when enabled.
+    save_aux: bool = False
     
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -1807,6 +1811,37 @@ _CONFIGS = [
         checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
     ),
     
+    TrainConfig( # this is a point track head with bigger point expert pi05_ours_full_finetune_openvla_libero_pt_v3_attend_action_FM
+        name="pi05_robocasa_pt_full_pt_v3_new_head",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False,
+                                   aux_expert_type="point",
+                                   point_expert_variant="point_head_v3",
+                                #    allow_aux_to_attend_suffix=True,
+                                   use_flow_matching=False,
+                                   use_new_head=True,
+                                   condition_aux_on_timestep=False
+                                   ),
+        # use_local_data=True,
+        data=LeRobotRobocasaPointTrackDataConfig(
+            # repo_id="physical-intelligence/libero",
+            repo_id="whwjdqls99/robocasa_pt",
+            base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
+            extra_delta_transform=False, # robocasa actions are already delta
+        ),
+        # batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/scratch2/whwjdqls99/pi/pi05_base", # please override this
+        num_train_steps=30_000,
+        checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
+    ),
     #### pi0 #####
     TrainConfig( # this is a point track head with bigger point expert
         name="pi0_robocasa_pt",

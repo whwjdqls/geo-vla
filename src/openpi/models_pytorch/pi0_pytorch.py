@@ -820,7 +820,8 @@ class PI0Pytorch(nn.Module):
 
             # Simple Huber loss (smooth L1)
             target_reshaped = aux_target.reshape(B, T, N, 3)
-            aux_loss = F.smooth_l1_loss(pred_reshaped, target_reshaped, reduction="mean")
+            # aux_loss = F.smooth_l1_loss(pred_reshaped, target_reshaped, reduction="mean")
+            aux_loss = F.l1_loss(pred_reshaped, target_reshaped, reduction="mean")
 
         elif aux_out is not None:
             # Fallback for depth or other aux types: use original linear projection
@@ -831,7 +832,8 @@ class PI0Pytorch(nn.Module):
             aux_pred = self._apply_checkpoint(aux_out_proj_func, aux_suffix_out)  # (BS, T, aux_dim)
 
             # Simple Huber loss (smooth L1)
-            aux_loss = F.smooth_l1_loss(aux_pred, aux_target, reduction="mean")
+            # aux_loss = F.smooth_l1_loss(aux_pred, aux_target, reduction="mean")
+            aux_loss = F.l1_loss(aux_pred, aux_target, reduction="mean")
         else:
             aux_loss = torch.tensor(0.0, device=state.device) # for compatibility
             

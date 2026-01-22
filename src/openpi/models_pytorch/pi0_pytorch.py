@@ -171,17 +171,18 @@ class PI0Pytorch(nn.Module):
             # Per-point feature MLP for output fusion (OpenVLA-OFT style)
             # Only created when use_point_fusion_mlp=True
             if self.use_point_fusion_mlp and config.aux_expert_type == "point":
-                self.point_hidden_dim = 256
+                self.point_hidden_dim = aux_expert_config.width  # 1024, match OpenVLA-OFT
                 self.point_mlp = nn.Sequential(
                     nn.Linear(3, self.point_hidden_dim),
                     nn.ReLU(),
                     nn.Linear(self.point_hidden_dim, self.point_hidden_dim),
                 )
                 # Fusion MLP: combines aux context (from transformer) with per-point features
+                # Input: ctx (1024) + point (1024) = 2048, same as OpenVLA-OFT
                 self.fusion_mlp = nn.Sequential(
-                    nn.Linear(aux_expert_config.width + self.point_hidden_dim, aux_expert_config.width),
+                    nn.Linear(aux_expert_config.width + self.point_hidden_dim, self.point_hidden_dim),
                     nn.GELU(),
-                    nn.Linear(aux_expert_config.width, 3),  # output per-point delta
+                    nn.Linear(self.point_hidden_dim, 3),  # output per-point delta
                 )
 
             if not config.use_flow_matching:

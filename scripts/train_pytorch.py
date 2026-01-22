@@ -851,7 +851,7 @@ def train_loop(config: _config.TrainConfig):
                             try:
                                 tmp_vis_dir = config.checkpoint_dir / "vis_tmp"
                                 tmp_vis_dir.mkdir(parents=True, exist_ok=True)
-                                
+
                                 save_aux_videos_and_log_wandb(
                                     aux_output,
                                     out_dir=tmp_vis_dir / "aux_videos",

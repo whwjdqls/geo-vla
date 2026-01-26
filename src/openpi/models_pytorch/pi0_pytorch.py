@@ -112,11 +112,75 @@ def enforce_aux_attention_masks(att_2d_masks, aux_pad_masks, aux_start, aux_end,
     return att_2d_masks
 
 
+def enforce_query_head_attention_masks(
+    att_2d_masks: torch.Tensor,
+    *,
+    pad_masks: torch.Tensor,
+    query_prefix_mask: torch.Tensor,
+    prefix_len: int,
+    suffix_len: int,
+    allow_query_to_attend_suffix: bool,
+) -> torch.Tensor:
+    """Enforce query-head cross-attention constraints.
+
+    Rules (for use_query_head=True):
+      - Suffix (action expert) can attend prefix EXCEPT query tokens.
+      - Prefix cannot attend suffix.
+      - If allow_query_to_attend_suffix=True, ONLY query tokens may attend suffix.
+
+    Notes:
+      - This edits a *boolean* attn mask where True means "allowed".
+      - We must use explicit 2D edits because the 1D mask_ar/cumsum scheme cannot express
+        "exclude a subset of prefix keys".
+    """
+    if att_2d_masks.ndim != 3:
+        raise ValueError(f"Expected att_2d_masks [B,S,S], got shape {tuple(att_2d_masks.shape)}")
+    if pad_masks.ndim != 2:
+        raise ValueError(f"Expected pad_masks [B,S], got shape {tuple(pad_masks.shape)}")
+    if query_prefix_mask.ndim != 2:
+        raise ValueError(
+            f"Expected query_prefix_mask [B,prefix_len], got shape {tuple(query_prefix_mask.shape)}"
+        )
+    batch_size, seq_len, _ = att_2d_masks.shape
+    if pad_masks.shape[0] != batch_size or pad_masks.shape[1] != seq_len:
+        raise ValueError(
+            f"pad_masks shape {tuple(pad_masks.shape)} incompatible with att_2d_masks {tuple(att_2d_masks.shape)}"
+        )
+    if query_prefix_mask.shape[0] != batch_size or query_prefix_mask.shape[1] != prefix_len:
+        raise ValueError(
+            f"query_prefix_mask shape {tuple(query_prefix_mask.shape)} incompatible with batch={batch_size}, prefix_len={prefix_len}"
+        )
+
+    suffix_start = prefix_len
+    suffix_end = prefix_len + suffix_len
+    if suffix_end > seq_len:
+        raise ValueError(
+            f"prefix_len+suffix_len ({suffix_end}) exceeds seq_len ({seq_len}) in enforce_query_head_attention_masks"
+        )
+
+    # A) Suffix queries cannot attend query tokens (query keys).
+    # Mask out query columns in the prefix key range.
+    att_2d_masks[:, suffix_start:suffix_end, :prefix_len] &= ~query_prefix_mask[:, None, :]
+
+    # B) Prefix cannot attend suffix (default).
+    att_2d_masks[:, :prefix_len, suffix_start:suffix_end] = False
+
+    # If enabled: ONLY query tokens in prefix may attend suffix.
+    if allow_query_to_attend_suffix:
+        suffix_key_valid = pad_masks[:, suffix_start:suffix_end]  # [B, suffix_len]
+        allowed = query_prefix_mask[:, :, None] & suffix_key_valid[:, None, :]
+        att_2d_masks[:, :prefix_len, suffix_start:suffix_end] = allowed
+
+    return att_2d_masks
+
+
 class PI0Pytorch(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
+
+        self.use_query_head = getattr(config, "use_query_head", False)
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -128,6 +192,7 @@ class PI0Pytorch(nn.Module):
             aux_expert_config = _gemma.get_config(config.depth_expert_variant)
         else:
             aux_expert_config = None
+
         self.aux_dim = aux_expert_config.aux_dim if aux_expert_config is not None else 0
         
         self.condition_aux_on_timestep = config.condition_aux_on_timestep
@@ -139,6 +204,16 @@ class PI0Pytorch(nn.Module):
         assert not (self.use_new_head and config.aux_expert_type == "none"), "use_new_head is only for auxiliary experts."
         # we cannot use self.use_new_head with allow_aux_to_attend_suffix
         assert not (self.use_new_head and config.allow_aux_to_attend_suffix), "use_new_head cannot be used with allow_aux_to_attend_suffix."
+
+        # Query head: no separate aux transformer; queries are injected into prefix stream.
+        assert not (self.use_query_head and self.use_new_head), "use_query_head and use_new_head cannot both be true."
+        if self.use_query_head:
+            assert (
+                config.aux_expert_type == "point"
+            ), "use_query_head is currently only supported for aux_expert_type='point'."
+            assert (
+                not config.use_flow_matching
+            ), "use_query_head currently supports regression only (use_flow_matching must be False)."
         
         use_adarms = [False, True] if self.pi05 else [False, False]
         if config.aux_expert_type in ["point", "depth"]:
@@ -147,12 +222,12 @@ class PI0Pytorch(nn.Module):
             else:
                 use_adarms.append(False) # no adaRMSNorm for regression aux expert
                 
+        aux_expert_config_for_model = None if self.use_query_head else aux_expert_config
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
             action_expert_config,
-            aux_expert_config, 
-            aux_expert_type=config.aux_expert_type, # pass aux_expert_type to the model
-            # use_adarms=[False, True] if self.pi05 else [False, False],
+            aux_expert_config_for_model,
+            aux_expert_type=config.aux_expert_type,  # pass aux_expert_type to the model
             use_adarms=use_adarms,
             precision=config.dtype,
             use_new_head=self.use_new_head,
@@ -164,14 +239,19 @@ class PI0Pytorch(nn.Module):
         self.use_flow_matching = config.use_flow_matching # this is for the aux head
         self.use_point_fusion_mlp = getattr(config, 'use_point_fusion_mlp', False)  # OpenVLA-OFT style fusion
 
+        # Width used for aux projections / fusion.
+        # - Regular aux expert: aux_expert_config.width
+        # - Query head: use prefix (PaliGemma) width
+        aux_width = paligemma_config.width if self.use_query_head else (aux_expert_config.width if aux_expert_config is not None else 0)
+
         if config.aux_expert_type in ["point", "depth"]:
-            self.aux_in_proj = nn.Linear(self.aux_dim, aux_expert_config.width)
-            self.aux_out_proj = nn.Linear(aux_expert_config.width, self.aux_dim)
+            self.aux_in_proj = nn.Linear(self.aux_dim, aux_width)
+            self.aux_out_proj = nn.Linear(aux_width, self.aux_dim)
 
             # Per-point feature MLP for output fusion (OpenVLA-OFT style)
             # Only created when use_point_fusion_mlp=True
             if self.use_point_fusion_mlp and config.aux_expert_type == "point":
-                self.point_hidden_dim = aux_expert_config.width  # 1024, match OpenVLA-OFT
+                self.point_hidden_dim = aux_width
                 self.point_mlp = nn.Sequential(
                     nn.Linear(3, self.point_hidden_dim),
                     nn.ReLU(),
@@ -180,19 +260,25 @@ class PI0Pytorch(nn.Module):
                 # Fusion MLP: combines aux context (from transformer) with per-point features
                 # Input: ctx (1024) + point (1024) = 2048, same as OpenVLA-OFT
                 self.fusion_mlp = nn.Sequential(
-                    nn.Linear(aux_expert_config.width + self.point_hidden_dim, self.point_hidden_dim),
+                    nn.Linear(aux_width + self.point_hidden_dim, self.point_hidden_dim),
                     nn.GELU(),
                     nn.Linear(self.point_hidden_dim, 3),  # output per-point delta
                 )
 
             if not config.use_flow_matching:
-                # for regression tasks, we use learnable query tokens
-                self.aux_query_tokens = nn.Parameter(torch.zeros(1, self.config.action_horizon, aux_expert_config.width))
-                if self.condition_aux_on_timestep:
-                    # project adarms_cond to use it for aux expert
-                    self.adarms_cond_to_aux = nn.Linear(action_expert_config.width, aux_expert_config.width)
+                if self.use_query_head:
+                    # Query head: learnable query tokens live in the *prefix* stream.
+                    self.prefix_query_tokens = nn.Parameter(torch.zeros(1, self.config.action_horizon, aux_width))
+                    self.aux_query_tokens = None
+                else:
+                    # Regression aux expert: learnable query tokens live in the aux stream.
+                    self.aux_query_tokens = nn.Parameter(torch.zeros(1, self.config.action_horizon, aux_width))
+                    if self.condition_aux_on_timestep:
+                        # project adarms_cond to use it for aux expert
+                        self.adarms_cond_to_aux = nn.Linear(action_expert_config.width, aux_width)
             else:
                 self.aux_query_tokens = None
+                self.prefix_query_tokens = None
             # else: # we use the same time_embeding after MLP as the main action head
             #     self.aux_time_mlp_in = nn.Linear(aux_expert_config.width, aux_expert_config.width)
             #     self.aux_time_mlp_out = nn.Linear(aux_expert_config.width, aux_expert_config.width)
@@ -349,13 +435,15 @@ class PI0Pytorch(nn.Module):
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
         """
         embs = []
         pad_masks = []
         att_masks = []
+
+        img_tokens_total = 0
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
@@ -366,6 +454,7 @@ class PI0Pytorch(nn.Module):
             img_emb = self._apply_checkpoint(image_embed_func, img)
 
             bsize, num_img_embs = img_emb.shape[:2]
+            img_tokens_total += num_img_embs
 
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs)) # (Bs, num_img_embs)
@@ -382,6 +471,34 @@ class PI0Pytorch(nn.Module):
 
         lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
 
+        query_lang_mask = None
+        if self.use_query_head:
+            if self.prefix_query_tokens is None:
+                raise ValueError("use_query_head=True requires prefix_query_tokens to be initialized")
+            query_len = int(self.config.action_horizon)
+            if query_len <= 0:
+                raise ValueError(f"Invalid action_horizon={self.config.action_horizon}")
+
+            # Insert queries into the padding region of the language tokens.
+            # This relies on there being enough padding space: text_len + query_len <= max_token_len.
+            bsize = lang_emb.shape[0]
+            max_len = lang_emb.shape[1]
+            insert_pos = lang_masks.to(torch.long).sum(dim=1)
+            if not torch.all(insert_pos + query_len <= max_len):
+                raise ValueError(
+                    "Not enough language padding to insert query tokens: "
+                    f"need action_horizon={query_len} extra tokens."
+                )
+
+            q = self.prefix_query_tokens.to(dtype=lang_emb.dtype, device=lang_emb.device).expand(bsize, -1, -1)
+            query_lang_mask = torch.zeros(bsize, max_len, dtype=torch.bool, device=lang_emb.device)
+            # Per-example insertion point.
+            for b in range(bsize):
+                start = int(insert_pos[b].item())
+                lang_emb[b, start : start + query_len, :] = q[b]
+                lang_masks[b, start : start + query_len] = True
+                query_lang_mask[b, start : start + query_len] = True
+
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
 
@@ -391,17 +508,25 @@ class PI0Pytorch(nn.Module):
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
 
-        # Get batch size from the first dimension of the concatenated tensors
+        # Build per-batch mask_ar (attention mask) so we can selectively allow
+        # only query tokens in the prefix to attend to suffix.
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
         bsize = pad_masks.shape[0]
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+        att_masks = att_masks[None, :].expand(bsize, len(att_masks)).clone()
+
+        query_prefix_mask = None
+        if self.use_query_head:
+            if query_lang_mask is None:
+                raise ValueError("Internal error: query_lang_mask was not created")
+            img_mask_prefix = torch.zeros(bsize, img_tokens_total, dtype=torch.bool, device=pad_masks.device)
+            query_prefix_mask = torch.cat([img_mask_prefix, query_lang_mask], dim=1)
         # att_masks is a (Bs, Seq_len) tensor with all 0 values which means
         # full attention for lang and img
         # pad_mask is a (Bs, num_image_embs*3 + max_token_len) tensor
         # (Bs, 256 *3 + 200)
         
-        return embs, pad_masks, att_masks
+        return embs, pad_masks, att_masks, query_prefix_mask
 
     def embed_suffix(self, state, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -711,18 +836,26 @@ class PI0Pytorch(nn.Module):
             aux_x_t = None
         
         
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
-        adarms_cond_for_aux = None if self.use_new_head else (adarms_cond if self.condition_aux_on_timestep else None)
-        aux_embs, aux_pad_masks, aux_att_masks = self.embed_aux(
-            aux_input,
-            aux_target,
-            state.shape[0],
-            state.device,
-            aux_x_t=aux_x_t,
-            adarms_cond=adarms_cond_for_aux,
-            t_aux=t_aux,
+        prefix_embs, prefix_pad_masks, prefix_att_masks, query_prefix_mask = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
         )
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+
+        if self.use_query_head:
+            aux_embs = None
+            aux_pad_masks = torch.empty(state.shape[0], 0, dtype=torch.bool, device=state.device)
+            aux_att_masks = torch.empty(state.shape[0], 0, dtype=torch.bool, device=state.device)
+        else:
+            adarms_cond_for_aux = None if self.use_new_head else (adarms_cond if self.condition_aux_on_timestep else None)
+            aux_embs, aux_pad_masks, aux_att_masks = self.embed_aux(
+                aux_input,
+                aux_target,
+                state.shape[0],
+                state.device,
+                aux_x_t=aux_x_t,
+                adarms_cond=adarms_cond_for_aux,
+                t_aux=t_aux,
+            )
         
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -745,6 +878,18 @@ class PI0Pytorch(nn.Module):
         # np.save("suffix_att_masks.npy", suffix_att_masks.cpu().numpy())
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
 
+        if self.use_query_head:
+            if query_prefix_mask is None:
+                raise ValueError("use_query_head=True requires query_prefix_mask")
+            att_2d_masks = enforce_query_head_attention_masks(
+                att_2d_masks,
+                pad_masks=pad_masks,
+                query_prefix_mask=query_prefix_mask,
+                prefix_len=prefix_embs.shape[1],
+                suffix_len=suffix_embs.shape[1],
+                allow_query_to_attend_suffix=self.config.allow_aux_to_attend_suffix,
+            )
+
         
         if aux_embs is not None and aux_target is not None:
             # when using auxiliary expert, we have to change the attention map
@@ -762,14 +907,19 @@ class PI0Pytorch(nn.Module):
         
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
-
+        import numpy as np
+        from PIL import Image  
+        # np.save("att_2d_masks_new.npy", att_2d_masks.cpu().numpy())
+        att_2d_masks_cpu = att_2d_masks[0].cpu().numpy().astype(np.uint8) * 255
+        Image.fromarray(att_2d_masks_cpu).save("/home/whwjdqls99/openpi/attention_vis/att_2d_masks_new_query_head.png")
         # Prepare attention masks
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
         # np.save("att_2d_masks_4d.npy", att_2d_masks_4d.cpu().numpy())
         # Apply gradient checkpointing if enabled
         # print("aux_embs shape:", aux_embs.shape if aux_embs is not None else "None" )
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out, aux_out), _ = self.paligemma_with_expert.forward(
+            (prefix_out, suffix_out, aux_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -777,13 +927,48 @@ class PI0Pytorch(nn.Module):
                 use_cache=False,
                 adarms_cond=[None, adarms_cond, adarms_cond] if self.use_flow_matching else [None, adarms_cond, None],
             )
-            return suffix_out, aux_out
+            return prefix_out, suffix_out, aux_out
 
-        suffix_out, aux_out = self._apply_checkpoint(
+        prefix_out, suffix_out, aux_out = self._apply_checkpoint(
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
-        if aux_out is not None and self.config.aux_expert_type == "point" and self.use_point_fusion_mlp:
+        aux_pred = None
+        if self.use_query_head and aux_target is not None:
+            if query_prefix_mask is None:
+                raise ValueError("use_query_head=True requires query_prefix_mask")
+            query_len = int(self.config.action_horizon)
+            query_out = prefix_out[query_prefix_mask].reshape(prefix_out.shape[0], query_len, -1).to(dtype=torch.float32)
+            aux_suffix_out = query_out
+
+            if self.config.aux_expert_type == "point" and self.use_point_fusion_mlp:
+                B, T, aux_dim = aux_target.shape
+                N = aux_dim // 3
+                point_cloud_t0 = aux_input.reshape(B, N, 3)
+
+                def point_mlp_func(point_cloud):
+                    return self.point_mlp(point_cloud)
+
+                point_feat = self._apply_checkpoint(point_mlp_func, point_cloud_t0)
+                ctx_expanded = aux_suffix_out.unsqueeze(2).expand(-1, -1, N, -1)
+                pt_expanded = point_feat.unsqueeze(1).expand(-1, T, -1, -1)
+                fusion_input = torch.cat([ctx_expanded, pt_expanded], dim=-1)
+
+                def fusion_mlp_func(fusion_input):
+                    return self.fusion_mlp(fusion_input)
+
+                pred_reshaped = self._apply_checkpoint(fusion_mlp_func, fusion_input)
+                aux_pred = pred_reshaped.reshape(B, T, N * 3)
+                target_reshaped = aux_target.reshape(B, T, N, 3)
+                aux_loss = F.l1_loss(pred_reshaped, target_reshaped, reduction="mean")
+            else:
+                def aux_out_proj_func(aux_suffix_out):
+                    return self.aux_out_proj(aux_suffix_out)
+
+                aux_pred = self._apply_checkpoint(aux_out_proj_func, aux_suffix_out)
+                aux_loss = F.l1_loss(aux_pred, aux_target, reduction="mean")
+
+        elif aux_out is not None and self.config.aux_expert_type == "point" and self.use_point_fusion_mlp:
             # compute auxiliary loss with per-point fusion (OpenVLA-OFT style)
             aux_suffix_out = aux_out[:, -aux_target.shape[1]:, :]  # (BS, T, width)
             aux_suffix_out = aux_suffix_out.to(dtype=torch.float32)
@@ -922,7 +1107,9 @@ class PI0Pytorch(nn.Module):
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks, query_prefix_mask = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -948,6 +1135,7 @@ class PI0Pytorch(nn.Module):
             v_t = self.denoise_step(
                 state,
                 prefix_pad_masks,
+                query_prefix_mask,
                 past_key_values,
                 x_t,
                 expanded_time,
@@ -962,6 +1150,7 @@ class PI0Pytorch(nn.Module):
         self,
         state,
         prefix_pad_masks,
+        query_prefix_mask,
         past_key_values,
         x_t,
         timestep,
@@ -974,6 +1163,16 @@ class PI0Pytorch(nn.Module):
         prefix_len = prefix_pad_masks.shape[1]
 
         prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+
+        if self.use_query_head:
+            if query_prefix_mask is None:
+                raise ValueError("use_query_head=True requires query_prefix_mask in denoise_step")
+            if query_prefix_mask.shape != (batch_size, prefix_len):
+                raise ValueError(
+                    f"query_prefix_mask shape {tuple(query_prefix_mask.shape)} expected {(batch_size, prefix_len)}"
+                )
+            # Suffix queries cannot attend query-token keys in prefix.
+            prefix_pad_2d_masks = prefix_pad_2d_masks & (~query_prefix_mask[:, None, :])
 
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
 
@@ -1037,7 +1236,9 @@ class PI0Pytorch(nn.Module):
         # 2) Prepare prefix/suffix embeddings for aux prediction.
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks, query_prefix_mask = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
 
         # Build point-cloud aux input (sample points so that N*3 == aux_dim).
         point_cloud = observation.point_cloud
@@ -1074,7 +1275,61 @@ class PI0Pytorch(nn.Module):
             return (delta_norm * delta_std) + delta_mean
 
         # 3) Predict normalized deltas (aux head).
-        if not self.use_flow_matching:
+        if self.use_query_head:
+            if query_prefix_mask is None:
+                raise ValueError("use_query_head=True requires query_prefix_mask")
+
+            time = torch.zeros(bsize, dtype=torch.float32, device=device)
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, actions_pred, time)
+
+            if (
+                self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+                == torch.bfloat16
+            ):
+                prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+                suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+
+            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+            att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+            att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+
+            att_2d_masks = enforce_query_head_attention_masks(
+                att_2d_masks,
+                pad_masks=pad_masks,
+                query_prefix_mask=query_prefix_mask,
+                prefix_len=prefix_embs.shape[1],
+                suffix_len=suffix_embs.shape[1],
+                allow_query_to_attend_suffix=self.config.allow_aux_to_attend_suffix,
+            )
+            position_ids = torch.cumsum(pad_masks, dim=1) - 1
+            att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+            (outputs_embeds, _) = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs, None],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond, None],
+            )
+            prefix_out = outputs_embeds[0]
+            query_len = int(self.config.action_horizon)
+            aux_suffix_out = prefix_out[query_prefix_mask].reshape(bsize, query_len, -1).to(dtype=torch.float32)
+
+            if self.use_point_fusion_mlp:
+                N = self.aux_dim // 3
+                point_cloud_t0 = aux_input.reshape(bsize, N, 3)
+                point_feat = self.point_mlp(point_cloud_t0)
+                T = aux_suffix_out.shape[1]
+                ctx_expanded = aux_suffix_out.unsqueeze(2).expand(-1, -1, N, -1)
+                pt_expanded = point_feat.unsqueeze(1).expand(-1, T, -1, -1)
+                fusion_input = torch.cat([ctx_expanded, pt_expanded], dim=-1)
+                pred_reshaped = self.fusion_mlp(fusion_input)
+                aux_pred_norm = pred_reshaped.reshape(bsize, T, N * 3)
+            else:
+                aux_pred_norm = self.aux_out_proj(aux_suffix_out)
+
+        elif not self.use_flow_matching:
             # Regression aux head: use learnable query tokens; optionally condition on timestep.
             time = torch.zeros(bsize, dtype=torch.float32, device=device)
             suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, actions_pred, time)

@@ -31,6 +31,7 @@ class Pi0Config(_model.BaseModelConfig):
     condition_aux_on_timestep: bool = False  # whether to condition aux expert on action expert timestep
     use_new_head: bool = False  # whether to use new head architecture for aux expert
     use_point_fusion_mlp: bool = False  # whether to use per-point fusion MLP for point tracking (OpenVLA-OFT style)
+    use_query_head: bool = False  
     # Set the model specific defaults.
     action_dim: int = 32
     action_horizon: int = 50

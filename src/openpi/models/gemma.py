@@ -147,6 +147,18 @@ def get_config(variant: Variant) -> Config:
         )
         assert config.aux_dim % 3 == 0, "aux_dim must be divisible by 3"
         return config
+    if variant == "point_head_v4": # this is the one that uses 256 point clouds
+        config =  Config(
+            width=1024,
+            depth=6,
+            mlp_dim=2048,
+            num_heads=8, # this must be matched
+            num_kv_heads=1,# this must be matched
+            head_dim=256, # this must be matched I think
+            aux_dim=256 * 3, # this must be divisible by 3
+        )
+        assert config.aux_dim % 3 == 0, "aux_dim must be divisible by 3"
+        return config
     if variant == "depth_head_v1":
         return Config(
             width=512,

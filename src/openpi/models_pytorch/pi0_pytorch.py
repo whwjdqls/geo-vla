@@ -910,8 +910,8 @@ class PI0Pytorch(nn.Module):
         import numpy as np
         from PIL import Image  
         # np.save("att_2d_masks_new.npy", att_2d_masks.cpu().numpy())
-        att_2d_masks_cpu = att_2d_masks[0].cpu().numpy().astype(np.uint8) * 255
-        Image.fromarray(att_2d_masks_cpu).save("/home/whwjdqls99/openpi/attention_vis/att_2d_masks_new_query_head.png")
+        # att_2d_masks_cpu = att_2d_masks[0].cpu().numpy().astype(np.uint8) * 255
+        # Image.fromarray(att_2d_masks_cpu).save("/home/whwjdqls99/openpi/attention_vis/att_2d_masks_new_query_head.png")
         # Prepare attention masks
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 

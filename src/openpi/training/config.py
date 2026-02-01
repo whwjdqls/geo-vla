@@ -537,6 +537,74 @@ class LeRobotRobocasaPointTrackDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotRealWorldPointTrackDataConfig(DataConfigFactory):
+    """
+    Real World 데이터용 Config (omy_f3m 로봇)
+
+    Real world data keys:
+    - observation.images.cam_top -> left_image (main camera)
+    - observation.images.cam_wrist -> wrist_image (wrist camera)
+    - observation.state -> state
+    - actions -> actions
+    - point_cloud -> point_cloud
+    """
+
+    extra_delta_transform: bool = False
+    use_local_data: bool = False
+    root_dir: str | None = None
+    action_sequence_keys: Sequence[str] = ("actions", "point_cloud")
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack transform: map real world data keys to expected model input keys
+        # Format: {NEW_OUTPUT_KEY: OLD_INPUT_KEY_PATH}
+        # Input keys use dots as separator (from LeRobot dataset)
+        # Output keys use slashes to match RobocasaInputs expectations
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        # Real world 3 camera views (new_key: old_key_path)
+                        # RobocasaInputs expects observation/xxx format
+                        "observation/left_image": "observation.images.cam_top",      # top camera
+                        "observation/right_image": "observation.images.cam_third",   # third person
+                        "observation/wrist_image": "observation.images.cam_wrist",   # wrist camera
+                        "observation/state": "observation.state",
+                        "actions": "actions",
+                        "prompt": "prompt",  # from PromptFromLeRobotTask (prompt_from_task=True)
+                        "point_cloud": "point_cloud",
+                    }
+                )
+            ]
+        )
+
+        # Use robocasa policy transforms (similar image processing)
+        data_transforms = _transforms.Group(
+            inputs=[robocasa_policy.RobocasaInputs(model_type=model_config.model_type)],
+            outputs=[robocasa_policy.RobocasaOutputs()],
+        )
+
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            use_local_data=self.use_local_data,
+            root_dir=self.root_dir,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotLiberoDepthDataConfig(DataConfigFactory):
     """LeRobot Libero config that also carries a depth_image sequence for aux training."""
 
@@ -1784,6 +1852,208 @@ _CONFIGS = [
         num_train_steps=30_000,
         checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
     ),
+    # Real World Track Head Config (local data)
+    TrainConfig(
+        name="pi05_real_world_pt_v3_new_head",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False,
+                                   aux_expert_type="point",
+                                   point_expert_variant="point_head_v3",
+                                   use_flow_matching=False,
+                                   use_new_head=True,
+                                   condition_aux_on_timestep=False,
+                                   use_point_fusion_mlp=True,
+                                   ),
+        data=LeRobotRealWorldPointTrackDataConfig(
+            repo_id="real_world_pt",  # will be overridden by root_dir
+            base_config=DataConfig(prompt_from_task=True),  # use task description as prompt
+            extra_delta_transform=False,
+            use_local_data=True,
+            root_dir="/weka/jisookim/dataset/real_world_lerobot/omy_f3m_pick_hat_depth_0128_pt",  # override this
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/weka/jisookim/experiment/pi05/pi05_base_pytorch",
+        num_train_steps=30_000,
+        checkpoint_base_dir="/weka/jisookim/experiment/pi05",
+    ),
+    TrainConfig(
+        name="pi05_robocasa_pt_full_pt_v4_new_head_openvla_like",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False,
+                                   aux_expert_type="point",
+                                   point_expert_variant="point_head_v4",
+                                #    allow_aux_to_attend_suffix=True,
+                                   use_flow_matching=False,
+                                   use_new_head=True,
+                                   condition_aux_on_timestep=False,
+                                   use_point_fusion_mlp=True,
+                                   ),
+        # use_local_data=True,
+        data=LeRobotRobocasaPointTrackDataConfig(
+            # repo_id="physical-intelligence/libero",
+            repo_id="whwjdqls99/robocasa_pt",
+            base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
+            extra_delta_transform=False, # robocasa actions are already delta
+        ),
+        # batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/scratch2/whwjdqls99/pi/pi05_base", # please override this
+        num_train_steps=30_000,
+        checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
+    ),
+    TrainConfig(
+        name="pi05_robocasa_pt_full_pt_v2_new_head_openvla_like",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False,
+                                   aux_expert_type="point",
+                                   point_expert_variant="point_head_v2",
+                                #    allow_aux_to_attend_suffix=True,
+                                   use_flow_matching=False,
+                                   use_new_head=True,
+                                   condition_aux_on_timestep=False,
+                                   use_point_fusion_mlp=True,
+                                   ),
+        # use_local_data=True,
+        data=LeRobotRobocasaPointTrackDataConfig(
+            # repo_id="physical-intelligence/libero",
+            repo_id="whwjdqls99/robocasa_pt",
+            base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
+            extra_delta_transform=False, # robocasa actions are already delta
+        ),
+        # batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/scratch2/whwjdqls99/pi/pi05_base", # please override this
+        num_train_steps=30_000,
+        checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
+    ),
+    TrainConfig(
+            name="pi05_libero_pt_full_pt_v3_new_head_openvla_like",
+            model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False,
+                                    aux_expert_type="point",
+                                    point_expert_variant="point_head_v3",
+                                    #    allow_aux_to_attend_suffix=True,
+                                    use_flow_matching=False,
+                                    use_new_head=True,
+                                    condition_aux_on_timestep=False,
+                                    use_point_fusion_mlp=True,
+                                    ),
+            # use_local_data=True,
+            # data=LeRobotRobocasaPointTrackDataConfig(
+            #     # repo_id="physical-intelligence/libero",
+            #     repo_id="whwjdqls99/robocasa_pt",
+            #     base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
+            #     extra_delta_transform=False, # robocasa actions are already delta
+            # ),
+            data=LeRobotLiberoPointTrackDataConfig(
+                # repo_id="physical-intelligence/libero",
+                use_local_data=True,
+                repo_id="whwjdqls99/libero_hdfr_lerobot_track_datasets_w_pt",
+                root_dir="/scratch2/whwjdqls99/libero/libero_hdfr_lerobot_track_datasets_w_pt",
+                base_config=DataConfig(prompt_from_task=True),
+                extra_delta_transform=False,
+            ),
+            # batch_size=256,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=10_000,
+                peak_lr=5e-5,
+                decay_steps=1_000_000,
+                decay_lr=5e-5,
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+            ema_decay=0.999,
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            pytorch_weight_path="/scratch2/whwjdqls99/pi/pi05_base", # please override this
+            num_train_steps=30_000,
+            checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
+        ),
+    TrainConfig(
+            name="pi0_robocasa_pt_full_pt_v3_new_head_openvla_like",
+            model=pi0_config.Pi0Config(pi05=False, action_horizon=10, discrete_state_input=False,
+                                    aux_expert_type="point",
+                                    point_expert_variant="point_head_v3",
+                                    #    allow_aux_to_attend_suffix=True,
+                                    use_flow_matching=False,
+                                    use_new_head=True,
+                                    condition_aux_on_timestep=False,
+                                    use_point_fusion_mlp=True,
+                                    ),
+            # use_local_data=True,
+            data=LeRobotRobocasaPointTrackDataConfig(
+                # repo_id="physical-intelligence/libero",
+                repo_id="whwjdqls99/robocasa_pt",
+                base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
+                extra_delta_transform=False, # robocasa actions are already delta
+            ),
+            # batch_size=256,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=10_000,
+                peak_lr=5e-5,
+                decay_steps=1_000_000,
+                decay_lr=5e-5,
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+            ema_decay=0.999,
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            pytorch_weight_path="/scratch2/whwjdqls99/pi/pi05_base", # please override this
+            num_train_steps=30_000,
+            checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
+        ),
+    TrainConfig(
+            name="pi0_libero_pt_full_pt_v3_new_head_openvla_like",
+            model=pi0_config.Pi0Config(pi05=False, action_horizon=10, discrete_state_input=False,
+                                    aux_expert_type="point",
+                                    point_expert_variant="point_head_v3",
+                                    #    allow_aux_to_attend_suffix=True,
+                                    use_flow_matching=False,
+                                    use_new_head=True,
+                                    condition_aux_on_timestep=False,
+                                    use_point_fusion_mlp=True,
+                                    ),
+            # use_local_data=True,
+            data=LeRobotLiberoPointTrackDataConfig(
+                # repo_id="physical-intelligence/libero",
+                use_local_data=True,
+                repo_id="whwjdqls99/libero_hdfr_lerobot_track_datasets_w_pt",
+                root_dir="/scratch2/whwjdqls99/libero/libero_hdfr_lerobot_track_datasets_w_pt",
+                base_config=DataConfig(prompt_from_task=True),
+                extra_delta_transform=False,
+            ),
+            # batch_size=256,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=10_000,
+                peak_lr=5e-5,
+                decay_steps=1_000_000,
+                decay_lr=5e-5,
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+            ema_decay=0.999,
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            pytorch_weight_path="/scratch2/whwjdqls99/pi/pi05_base", # please override this
+            num_train_steps=30_000,
+            checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
+        ),
+    
     TrainConfig(
         name="pi05_robocasa_pt_full_pt_v3_query_head_openvla_like",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False,
@@ -2048,6 +2318,29 @@ _CONFIGS = [
             repo_id="whwjdqls99/robocasa_pt",
             base_config=DataConfig(prompt_from_task=False),# we have "language_instruction" for robocasa"
             extra_delta_transform=False, # robocasa actions are already delta
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/scratch2/whwjdqls99/pi/pi_zero", # please override this
+        num_train_steps=30_000,
+        checkpoint_base_dir="/scratch2/whwjdqls99/pi", # please override this
+    ),
+    TrainConfig( # this is a point track head with bigger point expert
+        name="pi0_libero_pt_full",
+        model=pi0_config.Pi0Config(pi05=False, action_horizon=10, max_token_len=200, 
+                                   discrete_state_input=False,),
+        data=LeRobotLiberoDataConfig(
+            repo_id="whwjdqls99/libero_hdfr_lerobot_track_datasets_w_pt",
+            root_dir="/scratch2/whwjdqls99/libero/libero_hdfr_lerobot_track_datasets_w_pt",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
         ),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,

@@ -207,13 +207,14 @@ def create_torch_dataset(
         os.environ["HF_HUB_OFFLINE"] = "1"
         import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
         print("Using local data for LeRobotDataset, reloading module.")
-        dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.root_dir)
+        # Use revision="local" to skip HuggingFace version check
+        dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.root_dir, revision="local")
         # print("dataset_meta:", dataset_meta)
     else:
         import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
         dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
         # print("dataset_meta:", dataset_meta)
-        
+
     delta_timestamps = {
         key: (
             # Sequences that need t=0 input + future targets.
@@ -230,6 +231,7 @@ def create_torch_dataset(
             repo_id=repo_id,
             root=data_config.root_dir,
             delta_timestamps=delta_timestamps,
+            revision="local",  # Skip HuggingFace version check
         )
     else:
         dataset = lerobot_dataset.LeRobotDataset(

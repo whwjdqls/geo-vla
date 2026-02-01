@@ -554,6 +554,19 @@ class LeRobotRealWorldPointTrackDataConfig(DataConfigFactory):
     root_dir: str | None = None
     action_sequence_keys: Sequence[str] = ("actions", "point_cloud")
 
+    def _load_norm_stats_from_dataset(self, root_dir: str) -> dict[str, _transforms.NormStats] | None:
+        """Load norm_stats from dataset's meta directory."""
+        meta_dir = pathlib.Path(root_dir) / "meta"
+        try:
+            norm_stats = _normalize.load(meta_dir)
+            logging.info(f"Loaded norm stats from dataset meta: {meta_dir}")
+            print(f"[DATA] Loaded norm stats from dataset meta: {meta_dir}")
+            return norm_stats
+        except FileNotFoundError as e:
+            logging.warning(f"Norm stats not found in {meta_dir}: {e}")
+            print(f"[DEBUG] Norm stats not found in {meta_dir}: {e}")
+            return None
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         # Repack transform: map real world data keys to expected model input keys
@@ -593,8 +606,19 @@ class LeRobotRealWorldPointTrackDataConfig(DataConfigFactory):
 
         model_transforms = ModelTransformFactory()(model_config)
 
+        # Load base config first
+        base_config = self.create_base_config(assets_dirs, model_config)
+
+        # For real world data with use_local_data=True, load norm_stats from dataset meta directory
+        norm_stats = base_config.norm_stats
+        if self.use_local_data and self.root_dir:
+            dataset_norm_stats = self._load_norm_stats_from_dataset(self.root_dir)
+            if dataset_norm_stats is not None:
+                norm_stats = dataset_norm_stats
+
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base_config,
+            norm_stats=norm_stats,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -621,6 +645,19 @@ class LeRobotRealWorldDataConfig(DataConfigFactory):
     use_local_data: bool = False
     root_dir: str | None = None
     action_sequence_keys: Sequence[str] = ("actions",)  # No point_cloud for base model
+
+    def _load_norm_stats_from_dataset(self, root_dir: str) -> dict[str, _transforms.NormStats] | None:
+        """Load norm_stats from dataset's meta directory."""
+        meta_dir = pathlib.Path(root_dir) / "meta"
+        try:
+            norm_stats = _normalize.load(meta_dir)
+            logging.info(f"Loaded norm stats from dataset meta: {meta_dir}")
+            print(f"[DATA] Loaded norm stats from dataset meta: {meta_dir}")
+            return norm_stats
+        except FileNotFoundError as e:
+            logging.warning(f"Norm stats not found in {meta_dir}: {e}")
+            print(f"[DEBUG] Norm stats not found in {meta_dir}: {e}")
+            return None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -654,8 +691,19 @@ class LeRobotRealWorldDataConfig(DataConfigFactory):
 
         model_transforms = ModelTransformFactory()(model_config)
 
+        # Load base config first
+        base_config = self.create_base_config(assets_dirs, model_config)
+
+        # For real world data with use_local_data=True, load norm_stats from dataset meta directory
+        norm_stats = base_config.norm_stats
+        if self.use_local_data and self.root_dir:
+            dataset_norm_stats = self._load_norm_stats_from_dataset(self.root_dir)
+            if dataset_norm_stats is not None:
+                norm_stats = dataset_norm_stats
+
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base_config,
+            norm_stats=norm_stats,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,

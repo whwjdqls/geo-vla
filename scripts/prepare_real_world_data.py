@@ -425,12 +425,10 @@ def compute_norm_stats(all_data: pd.DataFrame, point_cloud_stats: Optional[Dict]
 
 def save_norm_stats(
     norm_stats: Dict,
-    assets_dir: Path,
-    config_name: str,
-    repo_id: str,
+    output_dir: Path,
 ) -> None:
-    """Save norm_stats.json to assets directory."""
-    output_path = assets_dir / config_name / repo_id / "norm_stats.json"
+    """Save norm_stats.json to dataset meta directory."""
+    output_path = output_dir / "meta" / "norm_stats.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(output_path, "w") as f:
@@ -521,29 +519,24 @@ def prepare_real_world_data(
     print("\n[8/9] Converting videos...")
     convert_videos(input_dir, output_dir, info)
 
-    # Generate norm_stats.json for training
+    # Generate norm_stats.json for training (saved in dataset directory)
     print("\n[9/9] Generating norm_stats.json...")
     norm_stats = compute_norm_stats(all_data, point_cloud_stats)
-    if assets_dir:
-        save_norm_stats(norm_stats, assets_dir, config_name, repo_id)
-    else:
-        # Default to project assets directory
-        default_assets = Path(__file__).parent.parent / "assets"
-        save_norm_stats(norm_stats, default_assets, config_name, repo_id)
+    save_norm_stats(norm_stats, output_dir)
 
     print(f"\n{'='*60}")
     print(f"Conversion complete!")
     print(f"{'='*60}")
     print(f"Output directory: {output_dir}")
     print(f"\nGenerated files:")
-    print(f"  - meta/info.json (v2.1 format)")
+    print(f"  - meta/info.json (v2.0 format)")
     print(f"  - meta/tasks.jsonl")
     print(f"  - meta/episodes.jsonl")
     print(f"  - meta/episodes_stats.jsonl")
     print(f"  - meta/stats.json")
+    print(f"  - meta/norm_stats.json")  # Now in dataset directory!
     print(f"  - data/chunk-XXX/episode_XXXXXX.parquet")
     print(f"  - videos/*/chunk-XXX/episode_XXXXXX.mp4")
-    print(f"  - assets/{config_name}/{repo_id}/norm_stats.json")
     print(f"{'='*60}\n")
 
 

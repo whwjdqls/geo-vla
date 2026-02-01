@@ -605,6 +605,67 @@ class LeRobotRealWorldPointTrackDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotRealWorldDataConfig(DataConfigFactory):
+    """
+    Real World 데이터용 Base Config (point_cloud 없음)
+
+    Real world data keys:
+    - observation.images.cam_top -> left_image (main camera)
+    - observation.images.cam_third -> right_image (third person camera)
+    - observation.images.cam_wrist -> wrist_image (wrist camera)
+    - observation.state -> state
+    - actions -> actions
+    """
+
+    extra_delta_transform: bool = False
+    use_local_data: bool = False
+    root_dir: str | None = None
+    action_sequence_keys: Sequence[str] = ("actions",)  # No point_cloud for base model
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        # Real world 3 camera views
+                        "observation/left_image": "observation.images.cam_top",
+                        "observation/right_image": "observation.images.cam_third",
+                        "observation/wrist_image": "observation.images.cam_wrist",
+                        "observation/state": "observation.state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[robocasa_policy.RobocasaInputs(model_type=model_config.model_type)],
+            outputs=[robocasa_policy.RobocasaOutputs()],
+        )
+
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            use_local_data=self.use_local_data,
+            root_dir=self.root_dir,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotLiberoDepthDataConfig(DataConfigFactory):
     """LeRobot Libero config that also carries a depth_image sequence for aux training."""
 
@@ -1869,6 +1930,30 @@ _CONFIGS = [
             extra_delta_transform=False,
             use_local_data=True,
             root_dir="/weka/jisookim/dataset/real_world_lerobot/omy_f3m_pick_hat_depth_0128_pt",  # override this
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/weka/jisookim/experiment/pi05/pi05_base_pytorch",
+        num_train_steps=30_000,
+        checkpoint_base_dir="/weka/jisookim/experiment/pi05",
+    ),
+    # Real World Base Model Config (no point cloud, just action prediction)
+    TrainConfig(
+        name="pi05_real_world_base",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotRealWorldDataConfig(
+            repo_id="real_world_base",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            use_local_data=True,
+            root_dir="/weka/jisookim/dataset/real_world_lerobot/omy_f3m_pick_hat_depth_0128_base",
         ),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
